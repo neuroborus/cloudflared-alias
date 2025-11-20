@@ -55,12 +55,7 @@ ingress:
    - Condition:
      - **Field:** `Hostname`
      - **Operator:** `equals`
-     - **Value:** `local.hasso.tech`  ← your hostname
-   - AND
-     - **Field:** `Path`
-     - **Operator:** `contains`
-     - **Value:** `/api/docs`
-   - (Create a second rule with `Path contains /api-json` if you also want no cache for the OpenAPI JSON.)
+     - **Value:** `localhost.hasso.tech`  ← your hostname
 4. **Then… (action):**
    - **Action:** `Cache`
    - **Setting:** `Bypass cache` (or `Cache level: Bypass` in the old UI)
