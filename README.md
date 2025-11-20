@@ -50,7 +50,7 @@ ingress:
 > Replace `hasso.tech` / `localhost.hasso.tech` with your own zone and hostname.
 
 1. In your zone (e.g. `hasso.tech`) go to: **Rules → Cache Rules → Create rule**.
-2. **Rule name:** `no-cache swagger docs`
+2. **Rule name:** `no-cache localhost`
 3. **When incoming requests match:**
    - Condition:
      - **Field:** `Hostname`
