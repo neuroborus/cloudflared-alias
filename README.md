@@ -10,6 +10,15 @@ The script:
 3. Kills any running `cloudflared` processes.
 4. Starts the specified tunnel with the updated config.
 
+Create an alias:
+
+1. `echo 'alias port-forward="$HOME/.cloudflared/run-tunnel.sh"' >> ~/.bashrc` (or your path to the script)
+2. `source ~/.bashrc`
+
+Then use:
+
+- `port-forward 3000`
+
 ---
 
 ## Requirements
@@ -35,3 +44,25 @@ ingress:
     service: http://localhost:3000
   - service: http_status:404
 ```
+
+### Cloudflare Cache Rule (example: `localhost.hasso.tech`)
+
+> Replace `hasso.tech` / `localhost.hasso.tech` with your own zone and hostname.
+
+1. In your zone (e.g. `hasso.tech`) go to: **Rules → Cache Rules → Create rule**.
+2. **Rule name:** `no-cache swagger docs`
+3. **When incoming requests match:**
+   - Condition:
+     - **Field:** `Hostname`
+     - **Operator:** `equals`
+     - **Value:** `local.hasso.tech`  ← your hostname
+   - AND
+     - **Field:** `Path`
+     - **Operator:** `contains`
+     - **Value:** `/api/docs`
+   - (Create a second rule with `Path contains /api-json` if you also want no cache for the OpenAPI JSON.)
+4. **Then… (action):**
+   - **Action:** `Cache`
+   - **Setting:** `Bypass cache` (or `Cache level: Bypass` in the old UI)
+5. **Save** and ensure the rule is **Enabled**.
+
