@@ -1,0 +1,10 @@
+:__CADDY_PORT__ {
+    @prefixed path /__PATH_ID__ /__PATH_ID__/*
+
+    handle @prefixed {
+        uri strip_prefix /__PATH_ID__
+        reverse_proxy localhost:__BACKEND_PORT__
+    }
+
+    respond "404 Not Found. Please verify the key in the URL. If the key is correct and the issue persists, contact me." 404
+}

@@ -1,0 +1,6 @@
+# Runtime artifacts for local Caddy/cloudflared launcher
+.runtime/
+
+# Optional local environment override files
+.env
+.env.*

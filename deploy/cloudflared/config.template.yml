@@ -1,0 +1,7 @@
+tunnel: __TUNNEL_NAME__
+credentials-file: __CREDENTIALS_FILE__
+
+ingress:
+  - hostname: __HOSTNAME__
+    service: http://localhost:__CADDY_PORT__
+  - service: http_status:404
