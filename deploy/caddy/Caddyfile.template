@@ -2,6 +2,7 @@
     @prefixed path /__PATH_ID__ /__PATH_ID__/*
 
     handle @prefixed {
+        header request X-Forwarded-Prefix "/__PATH_ID__"
         uri strip_prefix /__PATH_ID__
         reverse_proxy localhost:__BACKEND_PORT__
     }

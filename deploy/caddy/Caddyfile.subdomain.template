@@ -1,0 +1,10 @@
+# Subdomain mode: key is the hostname (<key>.<domain>). No path stripping — backend and Swagger work unchanged.
+:__CADDY_PORT__ {
+    @keyhost host __SUBDOMAIN_HOST__
+    handle @keyhost {
+        reverse_proxy localhost:__BACKEND_PORT__
+    }
+    handle {
+        respond "404 Not Found. Use the URL with your current key subdomain (e.g. https://<key>.<domain>/)." 404
+    }
+}
