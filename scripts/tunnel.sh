@@ -68,9 +68,10 @@ usage() {
 Usage:
   $(basename "$0") [options] <backend_port> [key]
   $(basename "$0") stop
-  $(basename "$0") history
+  $(basename "$0") --list
 
-  history, -h     Show last ${HISTORY_MAX} tunnels and pick one interactively.
+  --help, -h       Show this help.
+  --list, -l       Show last ${HISTORY_MAX} tunnels and pick one interactively.
 
 Modes: -p/--path | -s/--subdomain | -n/--no-key  (else from config DEFAULT_MODE)
   key              Optional. Used as path/subdomain key; else random.
@@ -580,6 +581,11 @@ main() {
     exit 0
   fi
 
+  if [[ $# -ge 1 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
+    usage
+    exit 0
+  fi
+
   load_config
   SOURCE_CF_CONFIG="${CLOUDFLARED_BASE_CONFIG:-$HOME/.cloudflared/config.yml}"
   CADDY_PORT="${CADDY_PORT:-9090}"
@@ -591,7 +597,7 @@ main() {
   PATH_ID_ARG=""
   MODE=""
 
-  if [[ $# -ge 1 && ( "$1" == "history" || "$1" == "-h" ) ]]; then
+  if [[ $# -ge 1 && ( "$1" == "--list" || "$1" == "-l" ) ]]; then
     history_pick_interactive
     shift
   else
@@ -600,7 +606,8 @@ main() {
         -p|--path)      MODE="path" ;;
         -s|--subdomain) MODE="subdomain" ;;
         -n|--no-key)    MODE="no-key" ;;
-        -h)             fail "Use: $(basename "$0") -h or $(basename "$0") history (no port)." ;;
+        -h|--help)      usage; exit 0 ;;
+        -l|--list)      fail "Use: $(basename "$0") --list or $(basename "$0") -l (no port)." ;;
         stop)           fail "Use: $(basename "$0") stop" ;;
         [0-9]*)        [[ -z "$BACKEND_PORT" ]] || fail "Only one backend port allowed."
                         BACKEND_PORT="$1" ;;

@@ -115,7 +115,7 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `.runtime/current-share-url.txt`: Current generated share URL.
 - `.runtime/current-path-id.txt`: Current generated prefix ID.
 - `.runtime/cloudflared/cloudflared.log`: Cloudflared log.
-- `.runtime/tunnel-history`: Last 10 tunnels (for `history` / `-h`).
+- `.runtime/tunnel-history`: Last 10 tunnels (for `--list` / `-l`).
 
 ## How to run
 
@@ -202,10 +202,10 @@ Restart with a new random ID:
 
 ## History (interactive pick)
 
-The last 10 tunnels are stored in `.runtime/tunnel-history` with **created** and **last used** timestamps. Use **`history`** or **`-h`** to open an interactive list in the terminal and pick a tunnel by number; the chosen entry is then started with the same mode and key (same share URL). You can override the backend port when prompted.
+The last 10 tunnels are stored in `.runtime/tunnel-history` with **created** and **last used** timestamps. Use **`--list`** or **`-l`** to open an interactive list in the terminal and pick a tunnel by number; the chosen entry is then started with the same mode and key (same share URL). You can override the backend port when prompted. Use **`--help`** or **`-h`** to show usage.
 
 ```bash
-./scripts/tunnel.sh history   # or: ./scripts/tunnel.sh -h
+./scripts/tunnel.sh --list   # or: ./scripts/tunnel.sh -l
 ```
 
 You’ll see a numbered list (1 = most recent). Enter a number to run that tunnel, or Enter with no number to cancel. Choosing an entry updates its **last used** time in the history.
