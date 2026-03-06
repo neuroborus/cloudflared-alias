@@ -2,6 +2,19 @@
 
 Cloudflare Tunnel with a local Caddy gate: share a backend via a keyed URL (path or subdomain) without changing the app.
 
+## Commands and flags
+
+| Flag / command | Description |
+|----------------|-------------|
+| `--help`, `-h` | Show usage and exit. |
+| `--list`, `-l` | Show last 10 tunnels and pick one interactively (run without port). |
+| `stop` | Stop all Caddy instances and cloudflared. |
+| `-p`, `--path` | Path mode (default): key in URL path. |
+| `-s`, `--subdomain` | Subdomain mode: key in hostname. |
+| `-n`, `--no-key` | No key: share URL = `https://<hostname>/`. |
+
+Examples: `./scripts/tunnel.sh -h` (help), `./scripts/tunnel.sh -l` (pick from history), `./scripts/tunnel.sh 3000` (start tunnel), `./scripts/tunnel.sh stop` (stop all).
+
 ## Quickstart
 
 1. Install Caddy:
@@ -22,7 +35,7 @@ sudo apt install -y caddy
 ./scripts/tunnel.sh 3000
 ```
 
-6. Open the printed share URL and append your route (e.g. `/swagger`). Use `-n` for no key, `-s` for subdomain; see **Modes** below.
+6. Open the printed share URL and append your route (e.g. `/swagger`). See **Commands and flags** above for `-n`, `-s`, `-l`, `-h`; **Modes** below for details.
 
 Optional alias for faster startup:
 
@@ -39,7 +52,7 @@ tunnel-share 3000
 
 ## Modes
 
-Default mode is **path** (key in URL path). Override with a flag or via config (see **Config file**).
+Default mode is **path** (key in URL path). Override with `-p` / `-s` / `-n` or via config (see **Config file**).
 
 | Mode | Flag | URL |
 |------|------|-----|
