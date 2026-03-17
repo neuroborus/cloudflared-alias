@@ -83,6 +83,7 @@ USAGE
 }
 
 # Format: mode \t path_id \t backend_port \t share_url \t created_ts \t last_used_ts
+# Replaces any existing entry with same share_url + backend_port (move to top, update last_used).
 add_to_history() {
   local mode="$1"
   local path_id="$2"
@@ -92,12 +93,22 @@ add_to_history() {
   local last_used_ts="${6:-$created_ts}"
   ensure_dirs
   local new_line="${mode}	${path_id}	${backend_port}	${share_url}	${created_ts}	${last_used_ts}"
-  if [[ -f "$HISTORY_FILE" ]]; then
-    { printf '%s\n' "$new_line"; head -n $(( HISTORY_MAX - 1 )) "$HISTORY_FILE"; } > "${HISTORY_FILE}.tmp"
-    mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  if [[ -f "$HISTORY_FILE" ]] && [[ -s "$HISTORY_FILE" ]]; then
+    printf '%s\n' "$new_line" > "$tmp_file"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local _ _ port url _ _
+      IFS=$'\t' read -r _ _ port url _ _ <<< "$line"
+      [[ "$url" == "$share_url" && "$port" == "$backend_port" ]] && continue
+      printf '%s\n' "$line" >> "$tmp_file"
+    done < "$HISTORY_FILE"
+    head -n "$HISTORY_MAX" "$tmp_file" > "$HISTORY_FILE"
   else
     printf '%s\n' "$new_line" > "$HISTORY_FILE"
   fi
+  rm -f "$tmp_file"
 }
 
 format_ts() {
@@ -114,13 +125,27 @@ list_history() {
     log "No tunnel history yet."
     return 0
   fi
+  local url_col=52 mode_col=10 port_col=6 date_col=16
+  local url_display
+  printf '%3s %-*s %-*s %*s %-*s\n' '#' "$url_col" 'URL' "$mode_col" 'MODE' "$port_col" 'PORT' "$date_col" 'LAST USED'
   local n=1
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     local mode path_id port url created_ts last_used_ts
     IFS=$'\t' read -r mode path_id port url created_ts last_used_ts <<< "$line"
     [[ -z "$last_used_ts" ]] && last_used_ts="$created_ts"
-    printf '  %d) %s  %s  port %s  last used %s\n' "$n" "$url" "$mode" "$port" "$(format_ts "$last_used_ts")"
+    # no-key entries may be stored as 5 fields (no path_id): mode, port, url, created_ts, last_used_ts
+    if [[ "$mode" == "no-key" && "$url" != *"://"* && "$port" == *"://"* ]]; then
+      local saved_url="$port"
+      port="$path_id"
+      url="$saved_url"
+    fi
+    if [[ ${#url} -gt "$url_col" ]]; then
+      url_display="${url:0:$(( url_col - 3 ))}..."
+    else
+      url_display="$url"
+    fi
+    printf '%3d %-*s %-*s %*s %-*s\n' "$n" "$url_col" "$url_display" "$mode_col" "$mode" "$port_col" "$port" "$date_col" "$(format_ts "$last_used_ts")"
     n=$(( n + 1 ))
   done < "$HISTORY_FILE"
 }
@@ -158,6 +183,15 @@ history_pick_interactive() {
   local share_url created_ts last_used_ts
   IFS=$'\t' read -r MODE PATH_ID_ARG BACKEND_PORT share_url created_ts last_used_ts <<< "$line"
   [[ -z "$last_used_ts" ]] && last_used_ts="$created_ts"
+  # no-key 5-field format: mode, port, url, created_ts, last_used_ts (path_id and port/url were shifted)
+  if [[ "$MODE" == "no-key" && "$share_url" != *"://"* && "$BACKEND_PORT" == *"://"* ]]; then
+    local saved_url="$BACKEND_PORT"
+    local saved_created_ts="$share_url"
+    BACKEND_PORT="$PATH_ID_ARG"
+    share_url="$saved_url"
+    PATH_ID_ARG=""
+    created_ts="$saved_created_ts"
+  fi
   printf '[tunnel] Backend port [%s]: ' "$BACKEND_PORT"
   read -r port_override
   port_override="$(trim "$port_override")"
