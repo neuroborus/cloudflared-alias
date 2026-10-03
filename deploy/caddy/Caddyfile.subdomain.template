@@ -1,5 +1,12 @@
 # Subdomain mode: key is the hostname (<key>.<domain>). No path stripping — backend and Swagger work unchanged.
+{
+    admin off
+    auto_https off
+    http_port __CADDY_PORT__
+}
+
 :__CADDY_PORT__ {
+    bind 127.0.0.1
     @keyhost host __SUBDOMAIN_HOST__
     handle @keyhost {
         reverse_proxy localhost:__BACKEND_PORT__

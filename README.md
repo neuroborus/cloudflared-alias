@@ -2,6 +2,35 @@
 
 Cloudflare Tunnel with a local Caddy gate: share a backend via a keyed URL (path or subdomain) without changing the app.
 
+## Development and Agent Runner
+
+Read [AGENTS.md](AGENTS.md) for ownership and working agreements. The canonical
+[finalization skill](.agents/skills/finalization/SKILL.md) is discovered by Agent
+Runner's `finalization: "auto"` setting. `.claude/skills` links to the same skills.
+`CLAUDE.md` links to `AGENTS.md` so Claude uses the same project instructions.
+
+Install Bash, ShellCheck, Python 3, Caddy and the Linux utilities listed below,
+then run `bash scripts/check.sh` for offline syntax, lint and regression checks.
+Tests use temporary project copies
+and synthetic data; they do not start public tunnels or use your `.runtime/`.
+Daemons are mocked; Caddy template checks inspect adapted configuration rather
+than exercising HTTP forwarding or public connectivity.
+The finalization skill owns the complete required-check sequence.
+
+Keep local tasks, plans and reports under the ignored `LOCAL_ARTIFACTS/` directory.
+Agent Runner's optional project configuration belongs at
+`LOCAL_ARTIFACTS/agent-runner.json`, and local operator additions at
+`LOCAL_ARTIFACTS/agent-runner/rules.md`. Keep its authoritative run state outside
+both the project and task trees. Read the installed operator guide through
+`guidance_read` or `agent-run guidance --project /path/to/cloudflared-alias`
+before supervising a run.
+
+Use `plan-authoring` for a reviewed plan, `plan-execution` on a clean worktree for
+planned local commits, and `polishing` for an existing non-empty local change set.
+`independent` is the default review mode. Finalization validates content; Agent
+Runner owns staging in its commit or handoff phase. Outside a run, requested
+finalization stages relevant changes and drafts a message without committing.
+
 ## Commands and flags
 
 | Flag / command | Description |
@@ -75,10 +104,11 @@ Examples:
 
 - Keeps your backend unchanged (e.g. `/swagger` stays `/swagger`).
 - Runs Caddy locally in front of the backend.
-- Generates a fresh random key on each run.
+- Generates a fresh random key in path/subdomain mode when no key is provided.
 - **Subdomain mode:** exposes the app at `https://<key>.<domain>/...`; requests use the same origin, so Swagger "Try it out" and all relative URLs work by default.
 - **Path mode:** exposes at `https://<hostname>/<key>/...`; Caddy strips `/<key>` before proxying.
-- Returns `404` for requests that don’t match the current key (wrong subdomain or path).
+- Returns `404` for requests that don’t match a keyed route, unless a no-key
+  instance provides a fallback on that hostname.
 
 ## Why Caddy
 
@@ -93,6 +123,8 @@ Internet -> Cloudflare Tunnel -> Caddy -> Local backend
 ## Prerequisites
 
 - Linux + `bash`
+- Standard Linux utilities, including `awk`, `sed`, `tr`, `head`, `tail`, `nohup`, `mktemp` and
+  `flock` (util-linux), plus `ss` (iproute2) or `netstat` to detect busy ports.
 - [`caddy`](https://caddyserver.com/docs/install)
 - [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
 - An existing named Cloudflare tunnel config with `tunnel:`, `credentials-file:` and `hostname:`. By default the script reads `~/.cloudflared/config.yml`; to use another file set `CLOUDFLARED_BASE_CONFIG=/path/to/config.yml`.
@@ -101,14 +133,18 @@ Internet -> Cloudflare Tunnel -> Caddy -> Local backend
 
 ## Config file (defaults)
 
-**`cloudflared-alias.conf`** in the project root holds defaults. Key=value, one per line; `#` = comment. Env vars override.
+**`cloudflared-alias.conf`** in the project root holds defaults. Use `KEY=value`,
+one per line. Lines starting with `#` and unquoted inline comments after whitespace
+are ignored; single or double quotes preserve spaces and `#` in values. Environment
+variables override the file, and the last file value wins for duplicate options.
+Unknown options and invalid values produce an error.
 
 Common options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `DEFAULT_MODE` | `path` | Default mode when no `-p`/`-s`/`-n`: `path`, `subdomain`, `no-key` |
-| `CADDY_PORT` | `9090` | Port Caddy listens on (cloudflared forwards here) |
+| `CADDY_PORT` | `9090` | Starting port for selecting a free Caddy listener (cloudflared forwards here) |
 | `ID_LENGTH` | `4` | Length of random key when not provided |
 | `DETACH` | `0` | `1` = run in background |
 
@@ -122,8 +158,11 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).
 - `deploy/caddy/Caddyfile.path-nokey.template`: Caddy (path, no key).
 - `deploy/cloudflared/config.template.yml`: Cloudflared template rendered at runtime.
-- `.runtime/registry`: List of running tunnel instances (key, port, Caddy port, PIDs).
-- `.runtime/instances/<port>/`: Per-instance Caddy config, PID, and log (one dir per running tunnel).
+- `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
+  Caddy port, Caddy PID, instance directory and hostname).
+- `.runtime/instances/<caddy-port>.<suffix>/`: Per-instance Caddy config, PID, log
+  and private Caddy data/config directories. Each run gets a unique directory.
+- `.runtime/launcher.lock`: Serializes start, stop and shared-state updates.
 - `.runtime/cloudflared/config.yml`: Rendered cloudflared config (multi-ingress to all instance ports).
 - `.runtime/current-share-url.txt`: Current generated share URL.
 - `.runtime/current-path-id.txt`: Current generated prefix ID.
@@ -147,7 +186,7 @@ Pass a key after the port to use it; otherwise a random key is generated (path/s
 ./scripts/tunnel.sh 3000        # path, random key
 ./scripts/tunnel.sh 3000 mykey  # path, key "mykey"
 ./scripts/tunnel.sh -n 3000     # no key
-./scripts/tunnel.sh -s 3000      # subdomain
+./scripts/tunnel.sh -s 3000     # subdomain
 ```
 
 ## Example command
@@ -161,20 +200,20 @@ Pass a key after the port to use it; otherwise a random key is generated (path/s
 ```text
 [tunnel] Starting Caddy on localhost:9090
 [tunnel] Starting cloudflared tunnel 'localhost-tunnel'
-[tunnel] Mode            : path (key in path)
+[tunnel] Mode            : path
 [tunnel] Tunnel hostname : local.hasso.tech
-[tunnel] Path ID         : k4m8q2w9x7pz (generated)
-[tunnel] Share URL       : https://local.hasso.tech/k4m8q2w9x7pz/
+[tunnel] Path ID         : k4m8
+[tunnel] Share URL       : https://local.hasso.tech/k4m8/
 [tunnel] Runtime files   : /.../cloudflared-alias/.runtime
-[tunnel] Logs            : /.../.runtime/instances/9090/caddy.log, /.../.runtime/cloudflared/cloudflared.log
+[tunnel] Logs            : /.../.runtime/instances/9090.A1b2C3/caddy.log, /.../.runtime/cloudflared/cloudflared.log
 [tunnel] Running in foreground. Press Ctrl+C to stop.
 ```
 
 ## Example final URL
 
-- **Path (default):** `https://local.hasso.tech/k4m8q2w9x7pz/` — Caddy strips `/<key>` before proxying.
+- **Path (default):** `https://local.hasso.tech/k4m8/` — Caddy strips `/<key>` before proxying.
 - **No-key (`-n`):** `https://local.hasso.tech/` — no key; Swagger and all routes work as-is.
-- **Subdomain (`-s`):** `https://k4m8q2w9x7pz.local.hasso.tech/` — key in hostname; relative URLs work without backend changes.
+- **Subdomain (`-s`):** `https://k4m8.local.hasso.tech/` — key in hostname; relative URLs work without backend changes.
 
 ## How it works
 
@@ -186,10 +225,39 @@ Pass a key after the port to use it; otherwise a random key is generated (path/s
 
 You can run several tunnels at once with **different keys and different backend ports**. Each run gets its own Caddy instance (on a free port from `CADDY_PORT` upward) and one shared cloudflared process forwards traffic to all of them.
 
-If you start a tunnel with a **key or backend port** that is already in use by another run, the script **stops the previous tunnel** (with a short message) and then starts the new one. Examples:
+Caddy listens over HTTP on loopback, including when its selected port is 443,
+with its admin API disabled so parallel instances do not compete for the default
+admin port. All instances must use the same tunnel
+name and credentials-file; stop them before changing that identity. If the shared
+config is missing or its identity cannot be recovered, startup fails and preserves
+existing state. Restore that config or stop the instances explicitly. Hostnames are
+kept per instance. Path ingress rules precede subdomain rules, followed by no-key
+fallbacks on the same host.
+
+Legacy registry rows without a hostname recover it from the persisted cloudflared
+ingress rule for their Caddy port before startup changes routing. If that mapping
+is missing or ambiguous, startup fails and preserves existing state; restore the
+persisted ingress or explicitly stop the instances before starting again.
+
+Backend ports must refer to the app, and cannot use a running launcher's Caddy
+listener port.
+
+Foreground mode reports unexpected Caddy or cloudflared exits and cleans up its
+instance. Shared cloudflared restarts when other runs start or stop keep
+foreground runs active.
+
+If you start a tunnel with a **key or backend port** that is already in use by
+another run, the script starts the new Caddy instance and shared cloudflared
+replacement before **stopping the previous tunnel** (with a short message).
+If either daemon fails to start, existing live instances and history are preserved.
+Dead instances are pruned even when startup fails; shared ingress and current
+share metadata are updated to the surviving instances, provided legacy hostnames
+can be recovered. When none remain, failed startup stops stale cloudflared and
+removes the current share metadata. Examples:
 
 - Same key, different port: the old tunnel for that key is stopped.
 - Same backend port, different key: the old tunnel using that port is stopped.
+- A second no-key run replaces the previous no-key instance.
 
 ```bash
 ./scripts/tunnel.sh 3000 key1    # first tunnel
@@ -222,6 +290,9 @@ The last 10 tunnels are stored in `.runtime/tunnel-history` with **created** and
 ```
 
 You’ll see a numbered list (1 = most recent). Enter a number to run that tunnel, or Enter with no number to cancel. Choosing an entry updates its **last used** time in the history.
+
+History updates after a successful start. If the saved URL differs from the
+current hostname configuration, start a new tunnel explicitly instead.
 
 ## Environment variables (override config file)
 
@@ -275,11 +346,11 @@ CADDY_PORT=18080 ./scripts/tunnel.sh 3000
 
 - **Subdomain:** You used an old key hostname, or DNS/ingress for `*.<SUBDOMAIN_DOMAIN>` is missing.
 - **Path:** You used an old key or a URL without the `/<key>/` prefix.
-- Caddy failed to start; check `.runtime/caddy/caddy.log`.
+- Caddy failed to start; check `.runtime/instances/<caddy-port>.<suffix>/caddy.log`.
 
 ### Swagger / OpenAPI: "Try it out" returns 404
 
-Use **subdomain mode** (default): open `https://<key>.local.hasso.tech/swagger` — requests from the UI go to the same origin, so they work without any backend config.
+Use **subdomain mode** (`-s`): open `https://<key>.local.hasso.tech/swagger` — requests from the UI go to the same origin, so they work without any backend config.
 
 In **path mode**, the backend must use the **`X-Forwarded-Prefix`** header to set Swagger’s server base path (Caddy sends this header).
 

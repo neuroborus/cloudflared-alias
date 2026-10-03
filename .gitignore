@@ -4,3 +4,11 @@
 # Optional local environment override files
 .env
 .env.*
+
+# Agent Runner tasks, plans, reports, local configuration and operator guidance
+/LOCAL_ARTIFACTS/
+/.agent-runner.json
+
+# Python regression-test bytecode
+__pycache__/
+*.py[cod]

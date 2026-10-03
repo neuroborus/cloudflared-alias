@@ -1,4 +1,11 @@
 # Path mode without key: proxy all requests to backend. Share URL = https://<hostname>/
+{
+    admin off
+    auto_https off
+    http_port __CADDY_PORT__
+}
+
 :__CADDY_PORT__ {
+    bind 127.0.0.1
     reverse_proxy localhost:__BACKEND_PORT__
 }
