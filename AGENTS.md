@@ -20,6 +20,9 @@ to `AGENTS.md`; edit shared instructions here.
 | `deploy/caddy/` | Caddy templates for path, subdomain and no-key modes |
 | `deploy/cloudflared/` | Cloudflared ingress template |
 | `scripts/check.sh`, `tests/` | Offline validation and regression tests |
+| `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py` | Isolated pinned toolchain preparation and prerequisite verification |
+| `pyproject.toml`, `requirements.lock`, `.python-version`, `deploy/toolchain.json` | Runtime and dependency pins, verified installation artifacts |
+| `.tools/`, `.venv/` | Ignored local runtimes and dependencies; trusted checks prepare their own scratch installations |
 | `README.md` | User-facing operation and Agent Runner setup |
 | `AGENTS.md`, `CLAUDE.md` | Shared agent instructions; `CLAUDE.md` links to `AGENTS.md` |
 | `.agents/skills/` | Canonical project skills; `.claude/skills` links here |

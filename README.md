@@ -9,13 +9,82 @@ Read [AGENTS.md](AGENTS.md) for ownership and working agreements. The canonical
 Runner's `finalization: "auto"` setting. `.claude/skills` links to the same skills.
 `CLAUDE.md` links to `AGENTS.md` so Claude uses the same project instructions.
 
-Install Bash, ShellCheck, Python 3, Caddy and the Linux utilities listed below,
-then run `bash scripts/check.sh` for offline syntax, lint and regression checks.
-Tests use temporary project copies
-and synthetic data; they do not start public tunnels or use your `.runtime/`.
+Install Bash, ShellCheck and the build prerequisites below, then prepare the
+isolated toolchain with `bash scripts/setup.sh`. Run `bash scripts/check.sh` for
+offline syntax, lint and regression checks using the pinned Python and Caddy.
+Tests use temporary project copies and synthetic data; they do not start public
+tunnels or use your `.runtime/`.
 Daemons are mocked; Caddy template checks inspect adapted configuration rather
 than exercising HTTP forwarding or public connectivity.
 The finalization skill owns the complete required-check sequence.
+
+### Pinned local setup
+
+The releases verified on 2026-10-03 are CPython **3.14.8**, Caddy **2.11.7** and
+cloudflared **2026.9.3**. `deploy/toolchain.json` records exact public artifact
+URLs, sizes and SHA-256 values. `.python-version` and `pyproject.toml` declare
+the runtime and direct dependencies; `requirements.lock` pins the complete
+Python wheel closure, including the test-only `quickjs-ng` browser engine.
+The official MCP SDK is pinned to **2.3.0**. These are installation prerequisites;
+the MCP and file-publication interfaces are not yet available.
+
+Preparation requires Linux x86_64, bootstrap Python 3.11 or newer (the inspected
+host's 3.12.3 is sufficient), `cc`/GCC, `make`, `ar`, `tar`, `xz`, and OpenSSL,
+zlib, libffi and bzip2 development headers. No PGO/LTO or optional readline,
+curses, gdbm, tkinter, sqlite or lzma development headers are required. Compiler
+jobs are limited to eight. Missing prerequisites or incompatible versions fail
+explicitly; no system tools are upgraded.
+
+```bash
+bash scripts/setup.sh
+export PATH="$PWD/.venv/bin:$PWD/.tools/caddy/usr/bin:$PATH"
+bash scripts/check-env.sh
+# Also verify the operator's installed connector, without starting it:
+bash scripts/check-env.sh --cloudflared "$(command -v cloudflared)"
+```
+
+Setup downloads only the frozen artifacts, rejects redirects and verifies every
+size and hash. It retains a private CPython source build and extracted Caddy in
+ignored `.tools/`, and installs the locked wheels offline in ignored `.venv/`.
+The bundled, separately hash-verified pip **26.2.1** supplies installation; there
+is no project-package build or setuptools/wheel installation. Rerunning setup
+verifies a completed installation. An incomplete or stale installation fails
+with instructions to remove it explicitly or choose empty paths; it is never
+silently replaced. Use the PATH above when running the launcher: the inspected
+host Caddy 2.6.2 does not satisfy the pin. Installed cloudflared 2026.9.3 already
+matches; setup leaves it unchanged.
+
+For installation without network access, supply a directory containing all
+manifest artifacts under their original filenames or SHA-256 names:
+
+```bash
+bash scripts/setup.sh --offline --artifacts /path/to/verified-artifacts
+```
+
+`--artifacts` always forbids downloads. `--tools DIR` and `--venv DIR` select
+private installation locations; defaults resolve from the project root even
+when invoked from a subdirectory. Checks themselves never download anything.
+
+### Runner artifact preparation
+
+Before execution, the supervisor must declare all 32 manifest URL/hash pairs
+for the exact trusted command `bash scripts/check.sh`, retaining its scratch,
+cache and sourceProjection capabilities. The artifacts total 54,418,213 bytes
+and fit Runner's limits. Keep this declaration and execution inputs frozen.
+Do not copy ignored host environments into the source projection.
+
+When Runner supplies `AGENT_RUNNER_DEPENDENCIES/<sha256>` and scratch through
+`TMPDIR`, the check creates a private scratch directory, verifies the supplied
+read-only artifacts, builds Python, reconstructs wheel filenames, installs
+offline with required hashes, and selects the extracted Caddy. Builds, test
+scratch and installations stay there and are removed on exit. No populated
+cache is required; the process works from an empty cache. Host compiler/header
+prerequisites still apply. Missing or corrupt artifacts fail before compilation.
+The check verifies exact runtime/dependency versions, native imports and
+`pip check`, then preserves the existing Bash syntax, ShellCheck and unittest
+sequence. Cloudflared remains mocked; these checks do not establish public DNS
+or Cloudflare connectivity. In Agent Runner, required checks run exclusively
+in FINALIZE, while staging and commit preparation belong to COMMIT.
 
 Keep local tasks, plans and reports under the ignored `LOCAL_ARTIFACTS/` directory.
 Agent Runner's optional project configuration belongs at
@@ -46,12 +115,11 @@ Examples: `./scripts/tunnel.sh -h` (help), `./scripts/tunnel.sh -l` (pick from h
 
 ## Quickstart
 
-1. Install Caddy:
+1. Prepare the pinned local Python and Caddy installations:
 
 ```bash
-# Debian/Ubuntu example:
-sudo apt update
-sudo apt install -y caddy
+bash scripts/setup.sh
+export PATH="$PWD/.venv/bin:$PWD/.tools/caddy/usr/bin:$PATH"
 ```
 
 2. Install cloudflared (if not installed):  
@@ -125,8 +193,8 @@ Internet -> Cloudflare Tunnel -> Caddy -> Local backend
 - Linux + `bash`
 - Standard Linux utilities, including `awk`, `sed`, `tr`, `head`, `tail`, `nohup`, `mktemp` and
   `flock` (util-linux), plus `ss` (iproute2) or `netstat` to detect busy ports.
-- [`caddy`](https://caddyserver.com/docs/install)
-- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+- Caddy 2.11.7, prepared locally with `scripts/setup.sh` (see pinned setup above).
+- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) 2026.9.3; setup does not install or upgrade the connector.
 - An existing named Cloudflare tunnel config with `tunnel:`, `credentials-file:` and `hostname:`. By default the script reads `~/.cloudflared/config.yml`; to use another file set `CLOUDFLARED_BASE_CONFIG=/path/to/config.yml`.
   - **Path / no-key:** one hostname in config (e.g. `local.hasso.tech`). One CNAME in DNS.
   - **Subdomain:** wildcard hostname (e.g. `*.local.hasso.tech`) and DNS wildcard; domain is derived from this.
@@ -153,6 +221,10 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 ## File overview
 
 - `scripts/tunnel.sh`: Main entrypoint.
+- `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py`: Pinned local
+  installation and environment verification; shared offline preparation for checks.
+- `pyproject.toml`, `requirements.lock`, `.python-version`: Python dependency and runtime pins.
+- `deploy/toolchain.json`: Verified artifact URLs, hashes, sizes and runtime versions.
 - `cloudflared-alias.conf`: Defaults (edit to change DEFAULT_MODE, CADDY_PORT, etc.).
 - `deploy/caddy/Caddyfile.template`: Caddy (path with key).
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).

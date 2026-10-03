@@ -12,3 +12,7 @@
 # Python regression-test bytecode
 __pycache__/
 *.py[cod]
+
+# Isolated pinned runtimes, verified downloads and Python dependencies
+/.tools/
+/.venv/
