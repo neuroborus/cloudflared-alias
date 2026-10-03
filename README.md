@@ -107,11 +107,63 @@ finalization stages relevant changes and drafts a message without committing.
 | `--help`, `-h` | Show usage and exit. |
 | `--list`, `-l` | Show last 10 tunnels and pick one interactively (run without port). |
 | `stop` | Stop all Caddy instances and cloudflared. |
+| `expose-port PORT [--url-mode MODE] [--key KEY]` | Expose a port, detach and return one JSON share result. |
+| `list-shares` | Return a JSON array of active launcher-owned shares without prompts. |
+| `stop-share ID` | Stop only the identified share and return its result with `state: "stopped"`. |
 | `-p`, `--path` | Path mode (default): key in URL path. |
 | `-s`, `--subdomain` | Subdomain mode: key in hostname. |
 | `-n`, `--no-key` | No key: share URL = `https://<hostname>/`. |
 
 Examples: `./scripts/tunnel.sh -h` (help), `./scripts/tunnel.sh -l` (pick from history), `./scripts/tunnel.sh 3000` (start tunnel), `./scripts/tunnel.sh stop` (stop all).
+
+### Structured share control
+
+```bash
+./scripts/tunnel.sh expose-port 3000 --key release-preview
+./scripts/tunnel.sh expose-port 3001 --url-mode subdomain --key api-preview
+./scripts/tunnel.sh list-shares
+./scripts/tunnel.sh stop-share 9090.Abc123  # Use the returned id
+```
+
+These commands write JSON to stdout and diagnostics to stderr. Exposure always
+detaches, so the share survives the invoking process. Results identify the
+individual instance rather than the shared last-URL file:
+
+```json
+{"id":"9090.Abc123","url":"https://example.test/release-preview/","source":{"type":"port","port":3000},"url_mode":"path","update_mode":null,"state":"active"}
+```
+
+IDs come from unique instance-directory names and remain stable until a share
+is stopped or replaced. Reusing a backend port or key replaces its previous
+share; starting another explicit `no-key` share replaces the previous no-key
+share. A failed replacement preserves the prior working share. Stopping one
+share refreshes the shared connector's ingress while preserving other Caddy
+instances; a failed refresh restores the prior registry and connector. Stopping
+the last share stops the owned connector. Unknown or unowned IDs fail without
+changing shares. Failures exit nonzero and return
+`{"error":{"code":"launcher_error","message":"..."}}`; an unknown active ID
+uses `unknown_share` as its code.
+
+The structured exposure default is always `path`, independently of legacy
+`DEFAULT_MODE`, `DETACH` and `ID_LENGTH`. Omitted keys use
+`secrets.token_hex(16)` (32 hex characters); explicit keys follow the existing
+1–32 character lowercase alphanumeric/hyphen rules. Bare-domain access requires
+`--url-mode no-key`, which cannot be combined with `--key`. Prefer useful keyed
+paths for ordinary content, and opaque random keys when the slug could reveal
+sensitive details. A key provides obscurity, not authentication.
+
+Listing includes legacy instances, derives each URL from its persisted routing
+data and does not migrate registry rows or consult interactive history. Caddy
+instances with a missing owned connector have `state: "degraded"`; stale or
+unowned Caddy entries are omitted. Listing and individual stopping need no
+source Cloudflare configuration or credentials. The original positional CLI,
+four-character legacy keys, foreground behavior, interactive history and
+stop-all remain available.
+
+Share commands prefer the prepared `.venv/bin/python3`, falling back to
+`python3` on PATH. Set `ALIAS_PYTHON` to select another prepared interpreter;
+this option accepts an executable path, including spaces, rather than a shell
+command. The legacy positional interface does not require this Python helper.
 
 ## Quickstart
 
@@ -215,12 +267,14 @@ Common options:
 | `CADDY_PORT` | `9090` | Starting port for selecting a free Caddy listener (cloudflared forwards here) |
 | `ID_LENGTH` | `4` | Length of random key when not provided |
 | `DETACH` | `0` | `1` = run in background |
+| `ALIAS_PYTHON` | `.venv/bin/python3` if available, else `python3` | Interpreter for structured share commands |
 
 You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config file.
 
 ## File overview
 
 - `scripts/tunnel.sh`: Main entrypoint.
+- `scripts/share_contract.py`: Typed share/error results and JSON serialization.
 - `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py`: Pinned local
   installation and environment verification; shared offline preparation for checks.
 - `pyproject.toml`, `requirements.lock`, `.python-version`: Python dependency and runtime pins.
@@ -233,7 +287,9 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
   Caddy port, Caddy PID, instance directory and hostname).
 - `.runtime/instances/<caddy-port>.<suffix>/`: Per-instance Caddy config, PID, log
-  and private Caddy data/config directories. Each run gets a unique directory.
+  and private Caddy data/config directories. Each run gets a unique directory;
+  structured exposures also persist their initial descriptor in `share.json`.
+  The registry and verified process ownership determine current active state.
 - `.runtime/launcher.lock`: Serializes start, stop and shared-state updates.
 - `.runtime/cloudflared/config.yml`: Rendered cloudflared config (multi-ingress to all instance ports).
 - `.runtime/current-share-url.txt`: Current generated share URL.

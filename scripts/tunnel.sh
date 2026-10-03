@@ -14,10 +14,15 @@ readonly HISTORY_FILE="${RUNTIME_DIR}/tunnel-history"
 readonly HISTORY_MAX=10
 readonly CONFIG_FILE="${ROOT_DIR}/cloudflared-alias.conf"
 readonly CF_TEMPLATE="${ROOT_DIR}/deploy/cloudflared/config.template.yml"
+readonly SHARE_CONTRACT="${ROOT_DIR}/scripts/share_contract.py"
 RUNTIME_LOCKED=0
+STRUCTURED=0
 
-log() { printf '[tunnel] %s\n' "$*"; }
-fail() { printf '[tunnel] Error: %s\n' "$*" >&2; exit 1; }
+log() {
+  if [[ "$STRUCTURED" == 1 ]]; then printf '[tunnel] %s\n' "$*" >&2
+  else printf '[tunnel] %s\n' "$*"; fi
+}
+fail() { FAILURE_MESSAGE="$*"; printf '[tunnel] Error: %s\n' "$*" >&2; exit 1; }
 trim() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -32,14 +37,21 @@ Usage:
   $(basename "$0") [options] <backend_port> [key]
   $(basename "$0") stop
   $(basename "$0") --list
+  $(basename "$0") expose-port PORT [--url-mode MODE] [--key KEY]
+  $(basename "$0") list-shares
+  $(basename "$0") stop-share ID
 
   --help, -h       Show this help.
   --list, -l       Show last ${HISTORY_MAX} tunnels and pick one interactively.
 Modes: -p/--path | -s/--subdomain | -n/--no-key (else config DEFAULT_MODE)
   key             Optional lowercase alphanumeric/hyphen key; else random.
+Share commands return JSON, use keyed path mode by default, and always detach.
+  --url-mode      path | subdomain | no-key (explicit bare-domain access)
+  --key           1–32 lowercase alphanumeric/hyphen characters; else 32 random hex.
 Config: ${CONFIG_FILE}
 Environment: DEFAULT_MODE, CADDY_PORT, ID_LENGTH, DETACH, CLOUDFLARED_BASE_CONFIG,
-             SUBDOMAIN_DOMAIN, TUNNEL_NAME, TUNNEL_HOSTNAME, TUNNEL_CREDENTIALS_FILE
+             SUBDOMAIN_DOMAIN, TUNNEL_NAME, TUNNEL_HOSTNAME, TUNNEL_CREDENTIALS_FILE,
+             ALIAS_PYTHON (share commands; defaults to .venv/bin/python3 or python3)
 USAGE
 }
 
@@ -70,7 +82,7 @@ load_config() {
   [[ -f "$CONFIG_FILE" ]] || return 0
   local line key value
   local -A from_env=()
-  for key in DEFAULT_MODE CADDY_PORT ID_LENGTH DETACH SUBDOMAIN_DOMAIN CLOUDFLARED_BASE_CONFIG; do
+  for key in DEFAULT_MODE CADDY_PORT ID_LENGTH DETACH SUBDOMAIN_DOMAIN CLOUDFLARED_BASE_CONFIG ALIAS_PYTHON; do
     [[ ! -v "$key" ]] || from_env["$key"]=1
   done
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -80,7 +92,7 @@ load_config() {
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
     case "$key" in
-      DEFAULT_MODE|CADDY_PORT|ID_LENGTH|DETACH|SUBDOMAIN_DOMAIN|CLOUDFLARED_BASE_CONFIG)
+      DEFAULT_MODE|CADDY_PORT|ID_LENGTH|DETACH|SUBDOMAIN_DOMAIN|CLOUDFLARED_BASE_CONFIG|ALIAS_PYTHON)
         if [[ ! -v "from_env[$key]" ]]; then
           value="$(scalar_value "$value")"
           printf -v "$key" '%s' "$value"
@@ -283,6 +295,13 @@ prune_registry() {
 registry_conflicts() {
   [[ "$BACKEND_PORT" == "$REG_BACKEND" || ( -n "$PATH_ID" && "$PATH_ID" == "$REG_KEY" ) || ( "$MODE" == no-key && "$REG_MODE" == no-key ) ]]
 }
+registry_pending_removal() {
+  if [[ -n "${STOPPING_INSTANCE_DIR:-}" ]]; then
+    [[ "$REG_DIR" == "$STOPPING_INSTANCE_DIR" ]]
+  else
+    registry_conflicts
+  fi
+}
 remove_conflicts() {
   local line tmp
   tmp="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
@@ -299,8 +318,9 @@ commit_registry_update() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "$line" ]] || continue
     parse_registry "$line"
-    if registry_conflicts; then
-      log "Stopping previous tunnel (key=${REG_KEY:-<no-key>}, port=${REG_BACKEND}) — same key or port."
+    if registry_pending_removal; then
+      if [[ -n "${STOPPING_INSTANCE_DIR:-}" ]]; then log "Stopping share ${REG_DIR##*/}"
+      else log "Stopping previous tunnel (key=${REG_KEY:-<no-key>}, port=${REG_BACKEND}) — same key or port."; fi
       stop_process "$REG_PID" caddy "${REG_DIR}/Caddyfile"
       rm -f "${REG_DIR}/caddy.pid"
     fi
@@ -470,9 +490,15 @@ refresh_cloudflared() {
     printf '%s\n' "$current_url" > "${RUNTIME_DIR}/current-share-url.txt"
     printf '%s\n' "$REG_KEY" > "${RUNTIME_DIR}/current-path-id.txt"
   else
-    stop_cloudflared
-    rm -f "$CF_CONFIG" "${RUNTIME_DIR}/current-share-url.txt" "${RUNTIME_DIR}/current-path-id.txt"
+    # With no survivors, stopping the target is the irreversible commit boundary.
+    [[ "${STOP_TRANSACTION:-0}" != 1 ]] || STOP_EMPTY_COMMITTED=1
+    finish_empty_registry
   fi
+}
+finish_empty_registry() {
+  commit_registry_update
+  stop_cloudflared
+  rm -f "$CF_CONFIG" "${RUNTIME_DIR}/current-share-url.txt" "${RUNTIME_DIR}/current-path-id.txt"
 }
 stop_all() {
   local line
@@ -495,7 +521,7 @@ stop_all() {
   log "Stopped runtime Caddy/cloudflared processes (if they were running)."
 }
 cleanup_on_exit() {
-  local status=$? line tmp registry_before
+  local status="$1" line tmp registry_before
   trap - EXIT
   # Complete rollback and shared connector updates even if another signal arrives.
   trap '' HUP INT TERM
@@ -530,6 +556,117 @@ cleanup_on_exit() {
   fi
   unlock_runtime
   return "$status"
+}
+
+exit_handler() {
+  local status=$?
+  trap - EXIT
+  # Error serialization must not leave a signal window before transaction cleanup.
+  trap '' HUP INT TERM
+  if [[ "$STRUCTURED" == 1 && "$status" != 0 ]]; then
+    if ! "${ALIAS_PYTHON:-python3}" "$SHARE_CONTRACT" error "${FAILURE_CODE:-launcher_error}" \
+      "${FAILURE_MESSAGE:-Launcher failed; see stderr for details.}"; then
+      printf '{"error":{"code":"launcher_error","message":"Launcher failed; see stderr for details."}}\n'
+    fi
+  fi
+  if [[ "${STOP_TRANSACTION:-0}" == 1 ]]; then
+    trap '' HUP INT TERM
+    finish_cloudflared_refresh
+    if [[ "${STOP_EMPTY_COMMITTED:-0}" == 1 ]]; then finish_empty_registry
+    elif [[ -n "${PENDING_REGISTRY_FILE:-}" ]]; then mv "$PENDING_REGISTRY_FILE" "$REGISTRY_FILE"; fi
+    [[ -z "${STOP_REGISTRY_FILE:-}" ]] || rm -f "$STOP_REGISTRY_FILE"
+    [[ -z "${STOP_BACKUP_FILE:-}" ]] || rm -f "$STOP_BACKUP_FILE"
+    [[ "$RUNTIME_LOCKED" != 1 ]] || unlock_runtime
+  elif [[ "${CLEANUP_ON_EXIT:-0}" == 1 ]]; then
+    cleanup_on_exit "$status"
+  fi
+  return "$status"
+}
+
+share_result() {
+  local state="${1:-active}" host="$REG_HOST" url shared_pid=""
+  [[ -n "$host" ]] || host="$(persisted_hostname "$REG_CADDY")" || fail "Cannot recover hostname for share ${REG_DIR##*/}."
+  validate_hostname "$host"
+  url="https://${host}/"
+  [[ "$REG_MODE" != path ]] || url="${url}${REG_KEY}/"
+  if [[ "$state" == active ]]; then
+    [[ ! -f "$CF_PID_FILE" ]] || shared_pid="$(cat "$CF_PID_FILE")"
+    is_owned_process "$shared_pid" cloudflared "$CF_CONFIG" || state=degraded
+  fi
+  "$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${REG_DIR##*/}" "$url" "$REG_BACKEND" "$REG_MODE" "$state"
+}
+
+list_shares() {
+  local line results="" result
+  if [[ ! -f "$REGISTRY_FILE" ]]; then printf '[]\n'; return 0; fi
+  lock_runtime
+  if [[ ! -f "$REGISTRY_FILE" ]]; then
+    unlock_runtime
+    printf '[]\n'
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    parse_registry "$line"
+    valid_registry_instance || continue
+    result="$(share_result)" || fail "Could not inspect share ${REG_DIR##*/}."
+    results+="${result}"$'\n'
+  done < "$REGISTRY_FILE"
+  printf '%s' "$results" | "$ALIAS_PYTHON" "$SHARE_CONTRACT" collect
+  unlock_runtime
+}
+
+find_active_share() {
+  local id="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    parse_registry "$line"
+    if [[ "${REG_DIR##*/}" == "$id" ]] && valid_registry_instance; then printf '%s' "$line"; return 0; fi
+  done < "$REGISTRY_FILE"
+  return 1
+}
+
+stop_share() {
+  local id="$1" line target="" result
+  [[ "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]] || fail "Invalid share ID."
+  FAILURE_CODE=unknown_share
+  [[ -f "$REGISTRY_FILE" ]] || fail "Unknown active share: ${id}."
+  # Reject unknown IDs without even creating a lock in an older runtime layout.
+  target="$(find_active_share "$id")" || fail "Unknown active share: ${id}."
+  lock_runtime
+  # Recheck ownership after acquiring the lock; a concurrent replacement may win.
+  target="$(find_active_share "$id")" || fail "Unknown active share: ${id}."
+  parse_registry "$target"
+  FAILURE_CODE=launcher_error
+  result="$(share_result stopped)" || fail "Could not inspect share ${id}."
+  STOPPING_INSTANCE_DIR="$REG_DIR"
+  STOP_TRANSACTION=1
+  trap 'handle_signal 129' HUP
+  trap 'handle_signal 130' INT
+  trap 'handle_signal 143' TERM
+  STOP_REGISTRY_FILE="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    parse_registry "$line"
+    [[ "$REG_DIR" != "$STOPPING_INSTANCE_DIR" ]] || continue
+    valid_registry_instance || continue
+    [[ -n "$REG_HOST" ]] || REG_HOST="$(persisted_hostname "$REG_CADDY")" || fail "Cannot recover hostname for share ${REG_DIR##*/}."
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$REG_MODE" "$REG_KEY" "$REG_BACKEND" "$REG_CADDY" "$REG_PID" "$REG_DIR" "$REG_HOST" >> "$STOP_REGISTRY_FILE"
+  done < "$REGISTRY_FILE"
+  if [[ -s "$STOP_REGISTRY_FILE" ]]; then
+    recover_shared_tunnel_identity || fail "Could not recover the running tunnel identity."
+    TUNNEL_NAME_VALUE="$SHARED_TUNNEL_NAME"; CREDENTIALS_FILE_VALUE="$SHARED_CREDENTIALS_FILE"
+  fi
+  STOP_BACKUP_FILE="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
+  cp "$REGISTRY_FILE" "$STOP_BACKUP_FILE"
+  PENDING_REGISTRY_FILE="$STOP_BACKUP_FILE"
+  STOP_BACKUP_FILE=""
+  mv "$STOP_REGISTRY_FILE" "$REGISTRY_FILE"
+  STOP_REGISTRY_FILE=""
+  refresh_cloudflared || fail "cloudflared failed to refresh. Check '${CF_LOG}'."
+  STOP_TRANSACTION=0
+  unlock_runtime
+  printf '%s\n' "$result"
 }
 
 parse_history() {
@@ -628,7 +765,8 @@ run_tunnel() {
   # Recover active identity and legacy routes before installing candidate cleanup.
   recover_shared_tunnel_identity || fail "Could not recover the running tunnel identity."
   recover_registry_hosts || fail "Could not recover the running instance hostnames."
-  trap cleanup_on_exit EXIT
+  CLEANUP_ON_EXIT=1
+  trap exit_handler EXIT
   trap 'handle_signal 129' HUP
   trap 'handle_signal 130' INT
   trap 'handle_signal 143' TERM
@@ -643,6 +781,10 @@ run_tunnel() {
     start_daemon CURRENT_CADDY_PID "${CURRENT_INSTANCE_DIR}/caddy.log" caddy run --config "${CURRENT_INSTANCE_DIR}/Caddyfile" --adapter caddyfile
   printf '%s\n' "$CURRENT_CADDY_PID" > "${CURRENT_INSTANCE_DIR}/caddy.pid"
   is_owned_process "$CURRENT_CADDY_PID" caddy "${CURRENT_INSTANCE_DIR}/Caddyfile" || fail "Caddy failed to start. Check '${CURRENT_INSTANCE_DIR}/caddy.log'."
+  if [[ "$STRUCTURED" == 1 ]]; then
+    SHARE_RESULT="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${CURRENT_INSTANCE_DIR##*/}" "$share_url" "$BACKEND_PORT" "$MODE" active)"
+    printf '%s\n' "$SHARE_RESULT" > "${CURRENT_INSTANCE_DIR}/share.json"
+  fi
   registry_backup="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
   if ! cp "$REGISTRY_FILE" "$registry_backup"; then rm -f "$registry_backup"; fail "Could not save the running instance registry."; fi
   PENDING_REGISTRY_FILE="$registry_backup"
@@ -663,6 +805,7 @@ run_tunnel() {
   if [[ "$DETACH" == 1 ]]; then
     KEEP_RUNNING=1
     log "Detached mode enabled (DETACH=1); processes continue in background."
+    [[ "$STRUCTURED" != 1 ]] || printf '%s\n' "$SHARE_RESULT"
     return 0
   fi
   log "Running in foreground. Press Ctrl+C to stop."
@@ -692,14 +835,57 @@ main() {
     [[ $# -eq 1 ]] || fail "Use: $(basename "$0") stop"
     lock_runtime; stop_all; unlock_runtime; return 0
   fi
+  case "$1" in
+    expose-port|list-shares|stop-share)
+      STRUCTURED=1
+      trap exit_handler EXIT ;;
+  esac
   load_config
+  if [[ "$STRUCTURED" == 1 ]]; then
+    if [[ ! -v ALIAS_PYTHON ]]; then
+      if [[ -x "${ROOT_DIR}/.venv/bin/python3" ]]; then ALIAS_PYTHON="${ROOT_DIR}/.venv/bin/python3"
+      else ALIAS_PYTHON=python3; fi
+    fi
+    require_cmd "$ALIAS_PYTHON"
+    case "$1" in
+      list-shares)
+        [[ $# -eq 1 ]] || fail "Use: $(basename "$0") list-shares"
+        list_shares; return 0 ;;
+      stop-share)
+        [[ $# -eq 2 ]] || fail "Use: $(basename "$0") stop-share ID"
+        # The rendered tunnel config supplies identity; no source config is read.
+        BACKEND_PORT=""; PATH_ID=""; ROUTE_HOST=""; CADDY_PORT=""
+        stop_share "$2"; return 0 ;;
+    esac
+  fi
   SOURCE_CF_CONFIG="${CLOUDFLARED_BASE_CONFIG:-$HOME/.cloudflared/config.yml}"
   CADDY_PORT="${CADDY_PORT-9090}"
   ID_LENGTH="${ID_LENGTH-4}"
   DETACH="${DETACH-0}"
   DEFAULT_MODE="${DEFAULT_MODE-path}"
   BACKEND_PORT=""; PATH_ID_ARG=""; MODE=""
-  if [[ "$1" == --list || "$1" == -l ]]; then
+  if [[ "$1" == expose-port ]]; then
+    shift
+    [[ $# -gt 0 ]] || fail "Use: $(basename "$0") expose-port PORT [--url-mode MODE] [--key KEY]"
+    BACKEND_PORT="$1"; shift
+    MODE=path; DETACH=1
+    local key_given=0 mode_given=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --url-mode)
+          [[ $# -ge 2 && "$mode_given" == 0 ]] || fail "Provide --url-mode once with a mode."
+          MODE="$2"; mode_given=1; shift ;;
+        --key)
+          [[ $# -ge 2 && "$key_given" == 0 ]] || fail "Provide --key once with a key."
+          PATH_ID_ARG="$2"; key_given=1; validate_key "$PATH_ID_ARG"; shift ;;
+        *) fail "Unknown expose-port option: '$1'." ;;
+      esac
+      shift
+    done
+    if [[ "$MODE" != no-key && "$key_given" == 0 ]]; then
+      PATH_ID_ARG="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" key)"
+    fi
+  elif [[ "$1" == --list || "$1" == -l ]]; then
     [[ $# -eq 1 ]] || fail "Use: $(basename "$0") --list (no port)."
     history_pick
   else
@@ -724,8 +910,11 @@ main() {
   [[ "$MODE" != no-key || -z "$PATH_ID_ARG" ]] || fail "Cannot use no-key mode and a key together."
   validate_number 'backend port' "$BACKEND_PORT" 65535
   validate_number CADDY_PORT "$CADDY_PORT" 65535
-  validate_number ID_LENGTH "$ID_LENGTH" 32
-  BACKEND_PORT=$(( 10#$BACKEND_PORT )); CADDY_PORT=$(( 10#$CADDY_PORT )); ID_LENGTH=$(( 10#$ID_LENGTH ))
+  if [[ "$STRUCTURED" != 1 ]]; then
+    validate_number ID_LENGTH "$ID_LENGTH" 32
+    ID_LENGTH=$(( 10#$ID_LENGTH ))
+  fi
+  BACKEND_PORT=$(( 10#$BACKEND_PORT )); CADDY_PORT=$(( 10#$CADDY_PORT ))
   [[ "$DETACH" =~ ^[01]$ ]] || fail "DETACH must be 0 or 1."
   local dependency
   for dependency in caddy cloudflared awk sed tr head tail flock mktemp nohup; do require_cmd "$dependency"; done

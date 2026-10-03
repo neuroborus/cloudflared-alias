@@ -36,7 +36,7 @@ def running(pid):
         return False
 
 
-class TunnelTests(unittest.TestCase):
+class TunnelFixture(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="cloudflared-alias-test-")
         self.addCleanup(self.scratch.cleanup)
@@ -46,7 +46,7 @@ class TunnelTests(unittest.TestCase):
         shutil.copytree(ROOT / "deploy", self.project / "deploy")
         shutil.copyfile(ROOT / "cloudflared-alias.conf", self.project / "cloudflared-alias.conf")
         self.env = os.environ.copy()
-        for key in ("DEFAULT_MODE", "CADDY_PORT", "ID_LENGTH", "DETACH", "SUBDOMAIN_DOMAIN", "TUNNEL_NAME", "TUNNEL_HOSTNAME", "TUNNEL_CREDENTIALS_FILE", "CLOUDFLARED_BASE_CONFIG"):
+        for key in ("DEFAULT_MODE", "CADDY_PORT", "ID_LENGTH", "DETACH", "SUBDOMAIN_DOMAIN", "TUNNEL_NAME", "TUNNEL_HOSTNAME", "TUNNEL_CREDENTIALS_FILE", "CLOUDFLARED_BASE_CONFIG", "ALIAS_PYTHON"):
             self.env.pop(key, None)
         self.source = self.project / "source.yml"
         self.source.write_text("tunnel: synthetic-tunnel\ncredentials-file: /synthetic/never-read.json\ningress:\n  - hostname: example.test\n    service: http_status:404\n")
@@ -118,6 +118,8 @@ class TunnelTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail("Foreground start did not finish")
 
+
+class TunnelTests(TunnelFixture):
     def test_help_has_no_runtime_effect(self):
         for flag in ("--help", "-h"):
             result = self.invoke(flag)

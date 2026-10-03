@@ -16,6 +16,7 @@ to `AGENTS.md`; edit shared instructions here.
 | Path | Owner |
 | --- | --- |
 | `scripts/tunnel.sh` | CLI, config loading, template rendering, process lifecycle, registry and history |
+| `scripts/share_contract.py` | Typed request-local share results, errors and JSON serialization |
 | `cloudflared-alias.conf` | Versioned launcher defaults; environment variables override them |
 | `deploy/caddy/` | Caddy templates for path, subdomain and no-key modes |
 | `deploy/cloudflared/` | Cloudflared ingress template |
