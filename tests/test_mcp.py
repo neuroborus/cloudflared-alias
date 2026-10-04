@@ -200,7 +200,7 @@ sys.exit(int(os.environ.get("TEST_SETUP_EXIT", "0")))
         self.assertEqual(self.config.read_text(), original)
 
 
-class MCPTests(ShareFixture):
+class MCPFixture(ShareFixture):
     def setUp(self):
         self.helpers = set()
         super().setUp()
@@ -226,8 +226,8 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         for path in self.runtime.glob("publications/*/helper.pid"):
             try:
                 self.helpers.add(int(path.read_text()))
-            except FileNotFoundError:
-                pass  # Another request may have stopped this share.
+            except (FileNotFoundError, ValueError):
+                pass  # Another request may be starting or stopping this share.
 
     def stop_test_processes(self):
         self.remember_helpers()
@@ -273,6 +273,8 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
     def run_client(self, body):
         asyncio.run(asyncio.wait_for(body(), timeout=90))
 
+
+class MCPTests(MCPFixture):
     def assert_guidance(self, text):
         for phrase in (
             "Always provide a key", "bare-domain", "path mode", "meaningful and useful",

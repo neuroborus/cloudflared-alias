@@ -14,9 +14,11 @@ isolated toolchain with `bash scripts/setup.sh`. Run `bash scripts/check.sh` for
 offline syntax, lint and regression checks using the pinned Python and Caddy.
 Tests use temporary project copies and synthetic data; they do not start public
 tunnels or use your `.runtime/`.
-Launcher daemons are mocked; file-serving tests use actual Caddy and the Python
-helper over loopback. Template checks also inspect adapted configuration. These
-checks do not establish public connectivity.
+Tests mock cloudflared; file-serving and MCP integration tests use actual pinned
+Caddy and publication helpers over loopback. The official SDK client exercises
+real stdio calls, session shutdown and independent share cleanup. Template checks
+also inspect adapted configuration. These checks do not establish public DNS or
+Cloudflare tunnel access.
 The finalization skill owns the complete required-check sequence.
 
 ### Pinned local setup
@@ -327,7 +329,8 @@ be combined with a key. A key provides obscurity, not authentication or access c
 Registration syntax follows the official [Codex MCP configuration](https://developers.openai.com/codex/mcp/)
 and [Claude Code MCP configuration](https://code.claude.com/docs/en/mcp).
 Regression tests use the pinned official SDK client over real stdio with
-synthetic tunnel configuration and mocked daemons.
+synthetic tunnel configuration. Integration coverage uses actual local Caddy
+and publication helpers with mocked cloudflared.
 
 ### Static file shares
 
@@ -339,6 +342,53 @@ applications or convert formats. Symlinks, the launcher root and internal metada
 are rejected; directory copies omit VCS and launcher metadata. Originals remain
 unchanged. The prepared interpreter and pinned dependencies are required for
 manual and live helpers.
+
+For a page with assets, select the containing directory:
+
+```text
+site/
+  index.html
+  assets/style.css
+  assets/image.svg
+```
+
+```bash
+# Live directory: edits to HTML or assets also refresh open HTML pages.
+./scripts/tunnel.sh expose-files ./site --key release-preview
+# Manual directory: each request reads current bytes; refresh the browser yourself.
+./scripts/tunnel.sh expose-files ./site --update-mode manual --key manual-preview
+# Snapshot of exactly one file; sibling assets are outside this selection.
+./scripts/tunnel.sh expose-files ./site/index.html --update-mode snapshot --key saved-page
+# Republish after an edit by repeating the same selection and key.
+./scripts/tunnel.sh expose-files ./site/index.html --update-mode snapshot --key saved-page
+# The same update modes also work under a keyed hostname.
+./scripts/tunnel.sh expose-files ./site --url-mode subdomain --key site-preview
+```
+
+With `example.test` as the configured hostname, the first share has base URL
+`https://example.test/release-preview/`; the selected snapshot file has URL
+`https://example.test/saved-page/index.html`. Its sibling `assets/style.css`
+is not published. Use relative asset URLs such as `assets/style.css` in path
+mode: `/assets/style.css` escapes the key prefix and is rejected. Nested pages
+can use `../assets/style.css`. Directory redirects retain the prefix and query.
+The subdomain example has base URL `https://site-preview.example.test/` and
+requires the existing wildcard DNS/tunnel setup described below. Bare-domain
+publishing requires the explicit `--url-mode no-key` choice.
+
+For sensitive or uncertain content, choose a cryptographically random opaque
+key without embedding sensitive details. This also supplies a fallback when
+there is no useful meaningful slug:
+
+```bash
+publication_key="$(.venv/bin/python3 -c 'import secrets; print(secrets.token_hex(16))')"
+./scripts/tunnel.sh expose-files ./report.pdf --update-mode snapshot --key "$publication_key"
+```
+
+Omitting the key generates the same 32 random hex characters. These URLs provide
+obscurity, not authentication; use access control when authentication is needed.
+In MCP, the corresponding requests are `expose_files(path="site", key="release-preview")`
+and `expose_files(path="report.pdf", update_mode="snapshot", key=publication_key)`;
+relative paths resolve from the project root even when the client starts below it.
 
 | Update mode | Behavior |
 | --- | --- |
@@ -359,6 +409,23 @@ live publications updating and refresh serves current accepted bytes. Server-sid
 preparation failures retain the last successful copy. If a helper exits, listing
 reports degraded state while Caddy keeps serving accepted bytes; stop and expose
 the share again to recover the helper.
+
+Live HTML uses an inline reload script and a same-origin `EventSource` connection
+to `<base URL>__alias/events`. A Content Security Policy that blocks inline
+scripts or the SSE connection prevents automatic reload; ordinary refresh still
+reads the latest accepted publication. PDF and other non-HTML viewers refresh
+manually even in live mode. Native inotify updates continue without subscribers;
+neither filesystem revision polling nor browser revision polling is used. Each
+SSE connection/reconnection receives the current accepted revision after its
+bytes are ready; comment heartbeats do not reload pages. This requires a named
+Cloudflare tunnel: Quick Tunnels do not support SSE.
+
+Custom Cloudflare Cache Rules must bypass caching for manual/live content and
+the event endpoint, preserving `Cache-Control: no-store`. Match the entire keyed
+path prefix in path mode, or the publication hostname in subdomain/no-key mode.
+Avoid buffering or compressing the event stream in an added proxy. If you choose
+to cache snapshots at the edge, purge a reused snapshot URL when republishing
+or choose a new key; a local new copy cannot invalidate custom edge caches.
 
 The launcher prepares publications and waits for helper readiness inside its
 existing startup transaction before installing the route. Failed or interrupted
