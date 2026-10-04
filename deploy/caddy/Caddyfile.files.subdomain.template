@@ -1,0 +1,50 @@
+{
+    admin off
+    auto_https off
+    http_port __CADDY_PORT__
+}
+
+:__CADDY_PORT__ {
+    bind 127.0.0.1
+    @keyhost host __SUBDOMAIN_HOST__
+
+    handle @keyhost {
+        route {
+            @traversal expression `{http.request.orig_uri}.matches('(?i)^[^?]*(/|%2f)([.]|%2e){1,2}(/|%2f|[?]|$)')`
+            respond @traversal "Invalid publication path" 400
+            @control path /__alias /__alias/*
+            respond @control 404
+            __CACHE_POLICY__
+            __PREPARATION_HANDLER__
+            root * "__PUBLIC_ROOT__"
+            file_server {
+                index index.html index.htm
+            }
+        }
+    }
+
+    handle {
+        respond "404 Not Found. Use the URL with your current key subdomain." 404
+    }
+
+    handle_errors 502 503 504 {
+        route {
+            rewrite * {http.request.orig_uri}
+            __CACHE_POLICY__
+            @fallback_method not method GET HEAD
+            respond @fallback_method 405
+            root * "__PUBLIC_ROOT__"
+            file_server {
+                index index.html index.htm
+                status 200
+                pass_thru
+            }
+            respond 404
+        }
+    }
+
+    handle_errors {
+        __CACHE_POLICY__
+        respond "" {http.error.status_code}
+    }
+}

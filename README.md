@@ -14,8 +14,9 @@ isolated toolchain with `bash scripts/setup.sh`. Run `bash scripts/check.sh` for
 offline syntax, lint and regression checks using the pinned Python and Caddy.
 Tests use temporary project copies and synthetic data; they do not start public
 tunnels or use your `.runtime/`.
-Daemons are mocked; Caddy template checks inspect adapted configuration rather
-than exercising HTTP forwarding or public connectivity.
+Launcher daemons are mocked; file-serving tests use actual Caddy and the Python
+helper over loopback. Template checks also inspect adapted configuration. These
+checks do not establish public connectivity.
 The finalization skill owns the complete required-check sequence.
 
 ### Pinned local setup
@@ -37,8 +38,39 @@ Each share has private state in `.runtime/publications/<id>/`. Its managed
 copies stay outside the served root. Failed preparation retains the accepted
 copy. SHA-256 revisions describe copied source bytes (a sorted path/digest
 manifest for directories), with a separate preparation-version-aware revision.
-Sources remain unchanged, and accepted copies stay frozen until preparation
-is explicitly requested again. This layer does not start services.
+Sources remain unchanged. Snapshot Caddy routes serve only the accepted copy;
+explicit preparation publishes new bytes. Internal file templates support path,
+subdomain and no-key routes, with loopback-only listeners and no automatic TLS
+or admin endpoint. Directory indexes are `index.html` and `index.htm`; other
+static files retain their ordinary MIME types, without directory browsing.
+
+The internal manual helper starts with
+`python3 scripts/publication.py serve-manual CONFIG.json`. Its private JSON
+configuration contains `source`, `share_id`, `project_root` and a loopback `port`.
+The template's `__PUBLIC_ROOT__` is the managed `public/` path. Snapshot rendering
+leaves `__CACHE_POLICY__` and `__PREPARATION_HANDLER__` empty; manual rendering
+sets the former to `header Cache-Control "no-store"` and the latter to a Caddy
+preparation block:
+
+```caddyfile
+forward_auth 127.0.0.1:PORT {
+    uri /__alias/prepare
+    @unavailable status 5xx
+    handle_response @unavailable {
+        error "Publication preparation unavailable" 502
+    }
+}
+```
+
+The templates serve the accepted copy if the helper is unavailable or returns
+a server error, retaining the route's key/path validation and no-store policy.
+Each GET/HEAD request prepares only the requested file or directory index before
+Caddy serves bytes. Manual mode has no watcher or reload injection. Deletions
+remove their served copies; unsafe reads and failed preparation preserve the
+last accepted bytes. Traversal, private metadata and the reserved `__alias`
+control namespace cannot be served. The helper never sends static file bodies.
+Public file-share commands remain deferred until all update modes and launcher
+lifecycle integration are available.
 
 Preparation requires Linux x86_64, bootstrap Python 3.11 or newer (the inspected
 host's 3.12.3 is sufficient), `cc`/GCC, `make`, `ar`, `tar`, `xz`, and OpenSSL,
@@ -295,6 +327,7 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `deploy/caddy/Caddyfile.template`: Caddy (path with key).
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).
 - `deploy/caddy/Caddyfile.path-nokey.template`: Caddy (path, no key).
+- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Internal snapshot/manual static routes.
 - `deploy/cloudflared/config.template.yml`: Cloudflared template rendered at runtime.
 - `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
   Caddy port, Caddy PID, instance directory and hostname).

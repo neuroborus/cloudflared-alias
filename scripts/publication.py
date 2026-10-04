@@ -4,16 +4,20 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
 import tempfile
+import threading
 from typing import Literal
+from urllib.parse import unquote
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PREPARATION_VERSION = "copy-v1"
+CONTROL_PATH = "__alias"
 EXCLUDED_NAMES = frozenset({
     ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
     ".runtime", ".agents", ".claude", ".codex", ".tools", ".venv",
@@ -30,6 +34,10 @@ class PublicationError(ValueError):
 
 class _UnstableSource(PublicationError):
     pass
+
+
+class InvalidRequest(PublicationError):
+    """The requested path is outside the publication's public selection."""
 
 
 @dataclass(frozen=True)
@@ -77,7 +85,8 @@ def select_source(path: str | Path, *, project_root: Path = PROJECT_ROOT) -> Sel
     # Do not normalize '..' across a possible symlink before inspecting ancestors.
     original = Path(path).absolute()
     absolute = _absolute(original)
-    if absolute == Path("/") or any(_excluded(name) for name in original.parts):
+    if absolute == Path("/") or any(_excluded(name) or name == CONTROL_PATH
+                                    for name in original.parts):
         raise PublicationError("Cannot publish root or internal metadata")
     try:
         with _parent(original) as (parent, name):
@@ -121,6 +130,8 @@ def _copy_entry(parent: int, name: str, destination: Path, relative: str,
         if stat.S_ISDIR(before.st_mode):
             destination.mkdir()
             for child in sorted(os.listdir(descriptor)):
+                if child == CONTROL_PATH:
+                    raise PublicationError("Source collides with the reserved control path")
                 if not _excluded(child):
                     child_relative = f"{relative}/{child}" if relative else child
                     _copy_entry(descriptor, child, destination / child,
@@ -160,6 +171,7 @@ class Publication:
         self.state_dir = self.project_root / ".runtime" / "publications" / share_id
         self.public_root = self.state_dir / "public"
         self.preparation_version = preparation_version
+        self._request_lock = threading.Lock()
 
     def _ensure_state(self) -> None:
         with _parent(self.project_root / ".runtime") as (descriptor, _), ExitStack() as stack:
@@ -186,6 +198,8 @@ class Publication:
         if generation is None:
             return None
         result = json.loads((generation / "metadata.json").read_text(encoding="utf-8"))
+        if result["source_revision"] is None:
+            return None  # A manual standalone-file request accepted its deletion.
         return PreparedPublication(result["source_revision"], result["revision"])
 
     def prepare(self, *, attempts: int = 3) -> PreparedPublication:
@@ -214,6 +228,7 @@ class Publication:
                     (generation / "metadata.json").write_text(json.dumps({
                         "source_revision": source_revision, "revision": revision,
                         "preparation_version": self.preparation_version,
+                        "manifest": manifest,
                     }), encoding="utf-8")
                     pending.symlink_to(f"{generation.name}/public")
                     os.replace(pending, self.public_root)
@@ -233,3 +248,179 @@ class Publication:
                 return result
         except OSError as error:
             raise PublicationError(f"Cannot prepare publication safely: {error}") from error
+
+    def prepare_request(self, uri: str) -> None:
+        """Refresh only the requested file/index; Caddy remains the byte server.
+
+        Clone accepted files with hard links, replacing changed entries only in
+        the pending generation. No source scan, watcher or in-place write occurs.
+        Unsafe or unstable reads leave the accepted generation intact.
+        """
+        path = uri.split("?", 1)[0]
+        try:
+            decoded = unquote(path, errors="strict")
+        except UnicodeError as error:
+            raise InvalidRequest("Invalid request encoding") from error
+        parts = [part for part in decoded.split("/") if part]
+        if (not path.startswith("/") or "\x00" in decoded or "\\" in decoded
+                or any(part in (".", "..", CONTROL_PATH) or _excluded(part)
+                       for part in parts)):
+            raise InvalidRequest("Path is outside the public selection")
+        if self.selection.kind == "file" and parts != [self.selection.path.name]:
+            raise InvalidRequest("Only the selected file is published")
+
+        with self._request_lock:
+            previous = self._generation()
+            if previous is None:
+                raise PublicationError("Prepare a publication before serving requests")
+            for attempt in range(3):
+                generation = Path(tempfile.mkdtemp(prefix="generation-", dir=self.state_dir))
+                try:
+                    public = generation / "public"
+                    shutil.copytree(previous / "public", public, copy_function=os.link)
+                    metadata = json.loads((previous / "metadata.json").read_text(encoding="utf-8"))
+                    manifest = dict(metadata["manifest"])
+                    self._refresh_requested(parts, decoded.endswith("/"), public, manifest)
+                    source_revision = (manifest.get(self.selection.path.name)
+                                       if self.selection.kind == "file"
+                                       else bundle_revision(list(manifest.items())))
+                    metadata.update(manifest=sorted(manifest.items()),
+                                    source_revision=source_revision,
+                                    revision=(effective_revision(source_revision, self.preparation_version)
+                                              if source_revision is not None else None))
+                    (generation / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+                    pending = generation / "activate"
+                    pending.symlink_to(f"{generation.name}/public")
+                    os.replace(pending, self.public_root)
+                except BaseException as error:
+                    if self._generation() == generation:
+                        raise
+                    shutil.rmtree(generation)
+                    if isinstance(error, (_UnstableSource, FileNotFoundError)) and attempt < 2:
+                        continue
+                    if isinstance(error, OSError):
+                        raise PublicationError(f"Cannot refresh publication safely: {error}") from error
+                    raise
+                shutil.rmtree(previous, ignore_errors=True)
+                # A valid deletion or directory-to-file replacement is accepted
+                # even when this request can no longer reach a published path.
+                if not public.joinpath(*parts).exists():
+                    raise InvalidRequest("Requested path is no longer published")
+                return
+
+    def _refresh_requested(self, parts: list[str], trailing_slash: bool,
+                           public: Path, manifest: dict[str, str]) -> None:
+        with _parent(self.selection.path) as (parent, selected), ExitStack() as stack:
+            if self.selection.kind == "file":
+                if trailing_slash:
+                    raise InvalidRequest("A file URL cannot end with a slash")
+                _refresh_file(parent, selected, public, selected, manifest)
+                return
+            # The selected directory must still be a real directory. Missing
+            # descendants are ordinary deletions; a missing root is a failure.
+            descriptor = os.open(selected, _DIRECTORY_FLAGS, dir_fd=parent)
+            stack.callback(os.close, descriptor)
+            for index, part in enumerate(parts):
+                try:
+                    info = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    _remove_copy(public, "/".join(parts[:index + 1]), manifest)
+                    return
+                if stat.S_ISREG(info.st_mode):
+                    if trailing_slash and index == len(parts) - 1:
+                        raise InvalidRequest("A file URL cannot end with a slash")
+                    # A regular replacement removes the directory's accepted
+                    # descendants only after its bytes are safely prepared.
+                    _refresh_file(descriptor, part, public,
+                                  "/".join(parts[:index + 1]), manifest)
+                    return
+                descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                stack.callback(os.close, descriptor)
+            relative = "/".join(parts)
+            _ensure_copy_directory(public, parts, manifest)
+            for index_name in ("index.html", "index.htm"):
+                name = f"{relative}/{index_name}" if relative else index_name
+                _refresh_file(descriptor, index_name, public, name, manifest)
+
+
+def _remove_copy(public: Path, relative: str, manifest: dict[str, str]) -> None:
+    destination = public / relative
+    if destination.is_dir():
+        shutil.rmtree(destination)
+    else:
+        destination.unlink(missing_ok=True)
+    for name in list(manifest):
+        if name == relative or name.startswith(relative + "/"):
+            del manifest[name]
+
+
+def _ensure_copy_directory(public: Path, parts: list[str], manifest: dict[str, str]) -> None:
+    for index in range(1, len(parts) + 1):
+        relative = "/".join(parts[:index])
+        destination = public / relative
+        if destination.is_file():
+            _remove_copy(public, relative, manifest)
+        destination.mkdir(exist_ok=True)
+
+
+def _refresh_file(parent: int, name: str, public: Path, relative: str,
+                  manifest: dict[str, str]) -> None:
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        _remove_copy(public, relative, manifest)
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise PublicationError("Requested source is not a regular file")
+    destination = public / relative
+    _ensure_copy_directory(public, relative.split("/")[:-1], manifest)
+    _remove_copy(public, relative, manifest)
+    copied = []
+    _copy_entry(parent, name, destination, relative, copied, "file")
+    manifest.update(copied)
+
+
+def manual_app(publication: Publication):
+    """Loopback preparation gate; successful replies contain no static bytes."""
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    def prepare(request):
+        uri = request.headers.get("x-forwarded-uri")
+        if uri is None:
+            return Response(status_code=400)
+        if request.headers.get("x-forwarded-method") not in ("GET", "HEAD"):
+            return Response(status_code=405, headers={"Allow": "GET, HEAD"})
+        try:
+            publication.prepare_request(uri)
+        except InvalidRequest:
+            return Response(status_code=404, headers={"Cache-Control": "no-store"})
+        except (PublicationError, OSError) as error:
+            logging.getLogger(__name__).warning("Keeping accepted publication: %s", error)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    return Starlette(routes=[Route("/__alias/prepare", prepare, methods=["GET"])])
+
+
+def main() -> None:
+    import argparse
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["serve-manual"])
+    parser.add_argument("config", type=Path)
+    arguments = parser.parse_args()
+    config = json.loads(arguments.config.read_text(encoding="utf-8"))
+    port = config["port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        parser.error("Helper port must be between 1 and 65535")
+    publication = Publication(config["source"], config["share_id"],
+                              project_root=Path(config["project_root"]))
+    if publication._generation() is None:
+        publication.prepare()
+    uvicorn.run(manual_app(publication), host="127.0.0.1", port=port, access_log=False)
+
+
+if __name__ == "__main__":
+    main()
