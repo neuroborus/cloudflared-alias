@@ -70,7 +70,10 @@ remove their served copies; unsafe reads and failed preparation preserve the
 last accepted bytes. Traversal, private metadata and the reserved `__alias`
 control namespace cannot be served. The helper never sends static file bodies.
 
-The internal live helper uses `serve-live` with the same private configuration.
+The internal live helper uses `serve-live` with the same private configuration,
+plus `event_url`: the browser's same-origin event path, including the key prefix
+in path mode (for example, `/preview/__alias/events`). It defaults to
+`/__alias/events` for subdomain and no-key routes.
 It installs native Linux `InotifyObserver` watches before preparing the initial
 copy, then debounces source events and activates complete generations before
 announcing their effective revisions. Directory watches are recursive; filtered
@@ -102,7 +105,23 @@ immediately receives the current `revision` event, whose JSON data contains `rev
 only the latest pending revision. Comment heartbeats maintain idle connections
 without inspecting sources. Static requests serve current accepted bytes even
 without a subscription, and event-service failure leaves accepted content
-available with no-store caching. HTML reload injection is added separately.
+available with no-store caching.
+
+Live preparation injects `scripts/reload.js` into served `.html` and `.htm` copies,
+including directory indexes and nested pages. Sources, snapshot and manual copies,
+and other formats stay unchanged. The script embeds the accepted effective
+revision and event path, uses native `EventSource`, and reloads once when a
+different revision arrives. Equal initial/reconnect revisions and heartbeats
+do not reload. Activation and back-forward-cache restoration replace subscriptions
+and recover missed changes; there is no browser polling. Source hashes exclude
+injected bytes, while the effective revision accounts for the script and event
+path, so asset-only changes also refresh HTML without a revision loop.
+
+Missing EventSource, blocked/disconnected SSE, or HTML that cannot execute the
+script (including restrictive Content Security Policy) leave native publication
+updates running. Ordinary refresh obtains the latest accepted content, including
+non-HTML formats. Custom edge-cache rules can override `no-store` and must be
+configured to preserve this behavior.
 Public file-share commands remain deferred until all update modes and launcher
 lifecycle integration are available.
 
@@ -353,6 +372,8 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 
 - `scripts/tunnel.sh`: Main entrypoint.
 - `scripts/share_contract.py`: Typed share/error results and JSON serialization.
+- `scripts/publication.py`, `scripts/reload.js`: Private static copies, native
+  publication events and reload behavior injected into served live HTML.
 - `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py`: Pinned local
   installation and environment verification; shared offline preparation for checks.
 - `pyproject.toml`, `requirements.lock`, `.python-version`: Python dependency and runtime pins.

@@ -1,9 +1,11 @@
 """Selection-bounded static copies; routing and lifecycle stay with the launcher."""
 
 import asyncio
+import codecs
 from contextlib import asynccontextmanager, contextmanager, ExitStack
 from dataclasses import dataclass
 import hashlib
+from html.parser import HTMLParser
 import json
 import logging
 import os
@@ -119,6 +121,52 @@ def effective_revision(source_revision: str, preparation_version: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+class _ReloadInsertion(HTMLParser):
+    """Find body end tags outside raw text, comments and inert templates."""
+
+    CDATA_CONTENT_ELEMENTS = ("script", "style", "title", "textarea", "xmp",
+                              "iframe", "noembed", "noframes", "noscript")
+
+    def __init__(self, html: str):
+        super().__init__(convert_charrefs=False)
+        self.insertion_offset = len(html)
+        self._line_offsets = [0] + [match.end() for match in re.finditer("\n", html)]
+        self._templates = 0
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "template":
+            self._templates += 1
+
+    def handle_endtag(self, tag):
+        if tag == "template":
+            self._templates = max(0, self._templates - 1)
+        elif tag == "body" and not self._templates:
+            line, column = self.getpos()
+            self.insertion_offset = min(self.insertion_offset, self._line_offsets[line - 1] + column)
+
+
+def _inject_reload(path: Path, script: str) -> None:
+    data = path.read_bytes()
+    # Latin-1 is a reversible byte mapping for ASCII-compatible HTML. Preserve
+    # BOM-declared UTF-16/32 too, without rewriting the source's encoding.
+    encoding = "latin-1"
+    for marker, candidate in ((codecs.BOM_UTF32_LE, "utf-32-le"),
+                              (codecs.BOM_UTF32_BE, "utf-32-be"),
+                              (codecs.BOM_UTF16_LE, "utf-16-le"),
+                              (codecs.BOM_UTF16_BE, "utf-16-be")):
+        if data.startswith(marker):
+            encoding = candidate
+            break
+    try:
+        html = data.decode(encoding)
+    except UnicodeError:
+        return  # Malformed encoded HTML remains available for ordinary refresh.
+    offset = _ReloadInsertion(html).insertion_offset
+    path.write_bytes((html[:offset] + script + html[offset:]).encode(encoding))
+
+
 def _copy_entry(parent: int, name: str, destination: Path, relative: str,
                 manifest: list[tuple[str, str]], expected_kind: str | None = None) -> None:
     descriptor = os.open(name, _ENTRY_FLAGS, dir_fd=parent)
@@ -210,10 +258,21 @@ class Publication:
             return PreparedPublication(result["source_revision"], result["revision"])
         raise PublicationError("Publication changed while reading its revision")
 
-    def prepare(self, *, attempts: int = 3) -> PreparedPublication:
+    def prepare(self, *, attempts: int = 3, event_url: str | None = None) -> PreparedPublication:
         if not 1 <= attempts <= 3:
             raise PublicationError("Preparation attempts must be between 1 and 3")
+        if event_url is not None and (not isinstance(event_url, str) or not re.fullmatch(
+                r"/(?:[a-z0-9-]+/)?__alias/events", event_url)):
+            raise PublicationError("Use a same-origin publication event path")
         try:
+            template = None
+            preparation_version = self.preparation_version
+            if event_url is not None:
+                template = Path(__file__).with_name("reload.js").read_text(encoding="ascii")
+                preparation_version = json.dumps([
+                    self.preparation_version, "html-reload-v2", event_url,
+                    hashlib.sha256(template.encode("ascii")).hexdigest(),
+                ], separators=(",", ":"))
             self._ensure_state()
             previous = self._generation()
             for attempt in range(attempts):
@@ -231,11 +290,20 @@ class Publication:
                         else:
                             _copy_entry(parent, name, public, "", manifest, selection.kind)
                             source_revision = bundle_revision(manifest)
-                    revision = effective_revision(source_revision, self.preparation_version)
+                    revision = effective_revision(source_revision, preparation_version)
+                    if template is not None:
+                        config = json.dumps({"revision": revision, "events": event_url},
+                                            separators=(",", ":"))
+                        script = ("\n<script data-alias-reload>\n"
+                                  + template.replace("__ALIAS_RELOAD_CONFIG__", config)
+                                  + "</script>\n")
+                        for relative, _ in manifest:
+                            if Path(relative).suffix.lower() in {".html", ".htm"}:
+                                _inject_reload(public / relative, script)
                     result = PreparedPublication(source_revision, revision)
                     (generation / "metadata.json").write_text(json.dumps({
                         "source_revision": source_revision, "revision": revision,
-                        "preparation_version": self.preparation_version,
+                        "preparation_version": preparation_version,
                         "manifest": manifest,
                     }), encoding="utf-8")
                     pending.symlink_to(f"{generation.name}/public")
@@ -414,9 +482,13 @@ def manual_app(publication: Publication):
 class LivePublication:
     """Native events prepare bytes independently of bounded SSE subscribers."""
 
-    def __init__(self, publication: Publication, *, debounce: float = 0.1):
+    def __init__(self, publication: Publication, *, debounce: float = 0.1,
+                 event_url: str = "/__alias/events"):
+        if not isinstance(event_url, str):
+            raise PublicationError("Live publication requires an event path")
         self.publication = publication
         self.debounce = debounce
+        self.event_url = event_url
         self.current: PreparedPublication | None = None
         self.subscribers: set[asyncio.Queue] = set()
         self._changed = asyncio.Event()
@@ -466,7 +538,7 @@ class LivePublication:
             # Watch first: events during initial copying remain queued, closing
             # the gap between the source read and the first accepted revision.
             self._observer.start()
-            self.current = await asyncio.to_thread(self.publication.prepare)
+            self.current = await asyncio.to_thread(self.publication.prepare, event_url=self.event_url)
             self._worker = asyncio.create_task(self._updates())
         except BaseException:
             await self.stop()
@@ -503,7 +575,7 @@ class LivePublication:
                         self._rewatch = True
                         raise
                 async with self._publication_lock:
-                    prepared = await asyncio.to_thread(self.publication.prepare)
+                    prepared = await asyncio.to_thread(self.publication.prepare, event_url=self.event_url)
                     if prepared == self.current:
                         continue
                     # Activation and announcement complete before a new
@@ -600,7 +672,7 @@ def main() -> None:
     publication = Publication(config["source"], config["share_id"],
                               project_root=Path(config["project_root"]))
     if arguments.command == "serve-live":
-        app = live_app(LivePublication(publication))
+        app = live_app(LivePublication(publication, event_url=config.get("event_url", "/__alias/events")))
     else:
         if publication._generation() is None:
             publication.prepare()

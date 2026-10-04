@@ -91,7 +91,9 @@ class FileHTTPFixture:
                 config.write_text(json.dumps({"source": str(share.selection.path),
                                               "share_id": share.state_dir.name,
                                               "project_root": str(self.project),
-                                              "port": helper_port}))
+                                              "port": helper_port,
+                                              "event_url": ("/test-key" if mode == "path" else "")
+                                              + "/__alias/events"}))
                 log = share.state_dir / "helper.log"
                 output = cleanup.enter_context(log.open("wb"))
                 helper = subprocess.Popen([sys.executable, str(self.project / "scripts/publication.py"),

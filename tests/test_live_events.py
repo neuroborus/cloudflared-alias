@@ -12,11 +12,13 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from publication import LivePublication, Publication, PublicationError
 from test_file_http import FileHTTPFixture
+from test_reload import injected_config, strip_reload
 
 
 def read_event(response):
@@ -54,8 +56,65 @@ class LiveHTTPTests(FileHTTPFixture, unittest.TestCase):
 
     def assert_content(self, request, path, expected):
         status, headers, body = request(path)
+        if Path(urlsplit(path).path).suffix.lower() in {".html", ".htm"}:
+            self.assertRegex(injected_config(body)["revision"], r"^[a-f0-9]{64}$")
+            body = strip_reload(body)
         self.assertEqual((status, body), (200, expected))
         self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_html_copies_track_asset_revisions_without_injection_loops(self):
+        original = b"<!doctype html><html><body><h1>original</h1></body></html>"
+        nested = self.source / "nested"
+        nested.mkdir()
+        page = nested / "page.HTM"
+        page.write_bytes(original)
+        self.html.write_bytes(original)
+        asset = self.source / "style.css"
+        for mode in ("path", "subdomain", "no-key"):
+            with self.subTest(mode=mode):
+                asset.write_bytes(b"initial asset")
+                with self.serve(update="live", mode=mode, with_events=True) as (share, request, events):
+                    current = share.current()
+                    event_url = ("/test-key" if mode == "path" else "") + "/__alias/events"
+                    for path in ("/", "/nested/page.HTM"):
+                        status, headers, body = request(path)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(headers["Cache-Control"], "no-store")
+                        self.assertEqual(strip_reload(body), original)
+                        self.assertEqual(injected_config(body),
+                                         {"revision": current.revision, "events": event_url})
+                    asset.write_bytes(b"changed asset")
+                    updated = self.wait_revision(share, current)
+                    # A refresh without any subscribers has the new embedded
+                    # revision even though neither HTML source changed.
+                    body = request("/index.html?refresh=1")[2]
+                    self.assertEqual(strip_reload(body), original)
+                    self.assertEqual(injected_config(body)["revision"], updated.revision)
+                    with events() as response:
+                        self.assertEqual(read_revision(response)["revision"], updated.revision)
+                    self.assertEqual(self.html.read_bytes(), original)
+                    self.assertEqual(page.read_bytes(), original)
+                    time.sleep(0.3)  # Drain native read events; injection must not watch itself.
+                    generation = share._generation()
+                    time.sleep(0.3)
+                    self.assertEqual(share.current(), updated)
+                    self.assertEqual(share._generation(), generation)
+
+    def test_standalone_non_html_remains_current_on_refresh_without_subscriptions(self):
+        selected = self.source / "report.pdf"
+        for mode in ("path", "subdomain", "no-key"):
+            with self.subTest(mode=mode):
+                selected.write_bytes(b"%PDF-initial\x00\xff")
+                with self.serve(selected, update="live", mode=mode) as (share, request):
+                    initial = share.current()
+                    self.assert_content(request, "/report.pdf", selected.read_bytes())
+                    selected.write_bytes(b"%PDF-changed\x00\xff")
+                    updated = self.wait_revision(share, initial)
+                    self.assertEqual(updated.source_revision,
+                                     hashlib.sha256(selected.read_bytes()).hexdigest())
+                    self.assert_content(request, "/report.pdf?refresh=1", selected.read_bytes())
+                    self.assertEqual(request("/report.pdf")[1]["Content-Type"], "application/pdf")
+                    self.assertEqual(request("/index.html")[0], 404)
 
     def test_revision_stream_follows_accepted_bytes_in_every_url_mode(self):
         for mode in ("path", "subdomain", "no-key"):
@@ -292,9 +351,9 @@ class NativeWatchTests(unittest.IsolatedAsyncioTestCase):
         prepare = share.prepare
         first = True
 
-        def edit_after_copy():
+        def edit_after_copy(**options):
             nonlocal first
-            result = prepare()
+            result = prepare(**options)
             if first:
                 first = False
                 self.file.write_bytes(b"changed before startup completed")
@@ -357,8 +416,8 @@ class NativeWatchTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(release.set)
         prepare = share.prepare
 
-        def pause_after_activation():
-            result = prepare()
+        def pause_after_activation(**options):
+            result = prepare(**options)
             activated.set()
             if not release.wait(timeout=5):
                 raise AssertionError("Preparation was not released")
