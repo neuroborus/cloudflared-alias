@@ -107,12 +107,14 @@ class LiveHTTPTests(FileHTTPFixture, unittest.TestCase):
                 selected.write_bytes(b"%PDF-initial\x00\xff")
                 with self.serve(selected, update="live", mode=mode) as (share, request):
                     initial = share.current()
-                    self.assert_content(request, "/report.pdf", selected.read_bytes())
+                    self.assert_content(request, "/", selected.read_bytes())
                     selected.write_bytes(b"%PDF-changed\x00\xff")
                     updated = self.wait_revision(share, initial)
                     self.assertEqual(updated.source_revision,
                                      hashlib.sha256(selected.read_bytes()).hexdigest())
+                    self.assert_content(request, "/?refresh=1", selected.read_bytes())
                     self.assert_content(request, "/report.pdf?refresh=1", selected.read_bytes())
+                    self.assertEqual(request("/")[1]["Content-Type"], "application/pdf")
                     self.assertEqual(request("/report.pdf")[1]["Content-Type"], "application/pdf")
                     self.assertEqual(request("/index.html")[0], 404)
 

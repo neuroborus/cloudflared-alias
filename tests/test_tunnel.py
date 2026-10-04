@@ -1048,7 +1048,8 @@ unlock_runtime''')
                         "__SUBDOMAIN_HOST__": "test-key.example.test",
                         "__PUBLIC_ROOT__": str(self.project / "public"),
                         "__CACHE_POLICY__": "", "__PREPARATION_HANDLER__": "",
-                        "__EVENT_HANDLER__": ""}
+                        "__EVENT_HANDLER__": "", "__FILE_HANDLER__": "",
+                        "__FALLBACK_FILE_HANDLER__": ""}
         for template in sorted((self.project / "deploy/caddy").glob("*.template")):
             for port in ("18080", "443"):
                 with self.subTest(template=template.name, port=port):

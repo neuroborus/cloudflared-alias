@@ -123,6 +123,7 @@ async def expose_port(
 
 @server.tool(description=(
     "Expose exactly one static file or recursive directory, preserving original sources. "
+    "A single file is served at the returned trailing-slash root URL, regardless of its filename. "
     + SOURCE_GUIDANCE + " No adjacent file discovery or symlinks. "
     "Live (default) publishes native file changes and reloads served HTML over SSE; "
     "manual reads current bytes on request; snapshot freezes bytes until republication. "

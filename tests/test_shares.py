@@ -465,14 +465,15 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         self.failure("expose-files", str(link))
         self.assertFalse(self.runtime.exists())
 
-    def test_snapshot_encodes_single_file_url_and_freezes_only_selected_bytes(self):
+    def test_snapshot_returns_root_url_and_freezes_only_selected_bytes(self):
         share = self.success("expose-files", str(self.page), "--update-mode", "snapshot", "--key", "preview")
-        self.assertEqual(share["url"], "https://example.test/preview/" + quote(self.page.name, safe=""))
+        self.assertEqual(share["url"], "https://example.test/preview/")
         self.assertEqual(share["source"], {"type": "file", "path": str(self.page)})
         self.assertEqual((share["url_mode"], share["update_mode"], share["state"]),
                          ("path", "snapshot", "active"))
         self.assertRegex(share["source_revision"], r"^[a-f0-9]{64}$")
         directory = self.publication(share)
+        self.assertEqual(json.loads((directory / "helper.json").read_text())["file_routing"], "root")
         public = directory / "public"
         self.assertEqual([path.name for path in public.iterdir()], [self.page.name])
         self.assertFalse((directory / "helper.pid").exists())
@@ -488,6 +489,45 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         self.assertFalse(directory.exists())
         self.assertTrue((self.content / "style.css").exists())
         self.assertFalse((self.runtime / "tunnel-history").exists())
+
+    def test_legacy_file_descriptors_keep_filename_when_listing_and_stopping(self):
+        share = self.success("expose-files", str(self.page), "--update-mode", "snapshot", "--key", "legacy")
+        config_path = self.publication(share) / "helper.json"
+        config = json.loads(config_path.read_text())
+        del config["file_routing"]
+        config_path.write_text(json.dumps(config))
+        before = self.saved_state()
+        legacy = share | {"url": share["url"] + quote(self.page.name, safe="")}
+        self.assertEqual(self.success("list-shares"), [legacy])
+        self.assertEqual(self.saved_state(), before)
+        self.assertEqual(self.success("stop-share", share["id"]), legacy | {"state": "stopped"})
+
+    def test_file_template_tokens_in_filenames_remain_literal(self):
+        filenames = (
+            "__FALLBACK_FILE_HANDLER__.html",
+            "__PUBLIC_ROOT____CACHE_POLICY____PREPARATION_HANDLER__"
+            "__EVENT_HANDLER____FILE_HANDLER____FALLBACK_FILE_HANDLER__.html",
+        )
+        for filename in filenames:
+            selected = self.content / filename
+            selected.write_bytes(b"<h1>selected</h1>")
+            for mode in ("path", "subdomain", "no-key"):
+                with self.subTest(filename=filename, mode=mode):
+                    args = () if mode == "no-key" else ("--key", "tokens")
+                    share = self.success("expose-files", str(selected), "--update-mode", "snapshot",
+                                         "--url-mode", mode, *args)
+                    config = self.runtime / "instances" / share["id"] / "Caddyfile"
+                    rendered = config.read_text()
+                    encoded = quote(filename, safe="")
+                    self.assertEqual(rendered.count(f"rewrite * /{encoded}\n"), 2)
+                    self.assertEqual(rendered.count(f"inline; filename*=UTF-8''{encoded}"), 2)
+                    env = os.environ | {"XDG_CONFIG_HOME": str(self.project / "config"),
+                                        "XDG_DATA_HOME": str(self.project / "data")}
+                    result = subprocess.run(["caddy", "adapt", "--config", str(config),
+                                             "--adapter", "caddyfile", "--validate"],
+                                            env=env, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.success("stop-share", share["id"])
 
     def test_failed_snapshot_replacement_preserves_accepted_copy_and_processes(self):
         share = self.success("expose-files", str(self.content), "--update-mode", "snapshot", "--key", "keep")

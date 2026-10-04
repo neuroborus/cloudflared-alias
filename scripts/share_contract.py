@@ -61,7 +61,9 @@ def file_share(share_id: str, url: str, mode: UrlMode, state: ShareState,
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     source: FileSource = {"type": config["source_type"], "path": config["source"]}
     if source["type"] == "file":
-        url += quote(Path(source["path"]).name, safe="")
+        url = url.rstrip("/") + "/"
+        if config.get("file_routing") != "root":
+            url += quote(Path(source["path"]).name, safe="")
     result: ShareResult = {"id": share_id, "url": url, "source": source,
                           "url_mode": mode, "update_mode": config["update_mode"], "state": state}
     prepared = current_publication(Path(config_path).parent)

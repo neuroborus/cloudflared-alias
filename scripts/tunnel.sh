@@ -404,10 +404,14 @@ render_template() {
     "$template" > "$output"
 }
 render_file_template() {
-  local template="$1" output="$2" content public_root cache="" prepare="" events=""
+  local template="$1" output="$2" content token public_root file_handler fallback_file_handler cache="" prepare="" events=""
   public_root="${CURRENT_PUBLICATION_DIR}/public"
   [[ "$public_root" != *[$'\n\r\t{}']* ]] || fail "Unsupported launcher path for Caddy file serving."
   public_root="${public_root//\\/\\\\}"; public_root="${public_root//\"/\\\"}"
+  file_handler="$("$ALIAS_PYTHON" "$PUBLICATION" caddy-file-handler \
+    --config "${CURRENT_PUBLICATION_DIR}/helper.json")" || fail "Could not render file routing."
+  fallback_file_handler="$("$ALIAS_PYTHON" "$PUBLICATION" caddy-file-handler --fallback \
+    --config "${CURRENT_PUBLICATION_DIR}/helper.json")" || fail "Could not render fallback file routing."
   if [[ "$UPDATE_MODE" != snapshot ]]; then cache='header >Cache-Control "no-store"'; fi
   if [[ "$UPDATE_MODE" == manual ]]; then
     prepare="forward_auth 127.0.0.1:${HELPER_PORT} {
@@ -425,11 +429,23 @@ render_file_template() {
   fi
   render_template "$template" "$output"
   content="$(cat "$output")"
-  content="${content//__PUBLIC_ROOT__/"$public_root"}"
-  content="${content//__CACHE_POLICY__/"$cache"}"
-  content="${content//__PREPARATION_HANDLER__/"$prepare"}"
-  content="${content//__EVENT_HANDLER__/"$events"}"
-  printf '%s\n' "$content" > "$output"
+  local -A replacements=(
+    [__PUBLIC_ROOT__]="$public_root"
+    [__CACHE_POLICY__]="$cache"
+    [__PREPARATION_HANDLER__]="$prepare"
+    [__EVENT_HANDLER__]="$events"
+    [__FILE_HANDLER__]="$file_handler"
+    [__FALLBACK_FILE_HANDLER__]="$fallback_file_handler"
+  )
+  # Scan only remaining template text; filenames and paths stay literal.
+  {
+    while [[ "$content" =~ __(PUBLIC_ROOT|CACHE_POLICY|PREPARATION_HANDLER|EVENT_HANDLER|FILE_HANDLER|FALLBACK_FILE_HANDLER)__ ]]; do
+      token="${BASH_REMATCH[0]}"
+      printf '%s%s' "${content%%"$token"*}" "${replacements[$token]}"
+      content="${content#*"$token"}"
+    done
+    printf '%s\n' "$content"
+  } > "$output"
 }
 
 start_publication() {

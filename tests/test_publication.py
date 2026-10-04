@@ -7,11 +7,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from urllib.parse import quote
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import publication
-from publication import Publication, PublicationError, select_source
+from publication import InvalidRequest, Publication, PublicationError, select_source
 
 
 class PublicationTests(unittest.TestCase):
@@ -58,6 +59,43 @@ class PublicationTests(unittest.TestCase):
         self.file.write_bytes(b"new bytes")
         self.file.unlink()
         self.assertEqual(self.files(share), {"index.html": original})
+        self.assert_private(share)
+
+    def test_single_file_root_refresh_is_isolated_and_recovers_from_deletion(self):
+        selected = self.source / "page ?#%é.htm"
+        selected.write_bytes(b"original")
+        share = self.publication(selected)
+        share.prepare()
+        selected.write_bytes(b"updated")
+        (self.source / "secret.txt").write_bytes(b"unselected")
+        share.prepare_request("/?refresh=%23%25")
+        self.assertEqual(self.files(share), {selected.name: b"updated"})
+        accepted = share.current()
+        for path in ("/secret.txt", "/index.html", "/../", "/%2e%2e/", "/__alias/events",
+                     "/" + quote(selected.name, safe="") + "/extra"):
+            with self.subTest(path=path), self.assertRaises(InvalidRequest):
+                share.prepare_request(path)
+            self.assertEqual(share.current(), accepted)
+        selected.unlink()
+        with self.assertRaises(InvalidRequest):
+            share.prepare_request("/")
+        self.assertEqual(self.files(share), {})
+        self.assertIsNone(share.current())
+        selected.write_bytes(b"recreated")
+        share.prepare_request("/")
+        self.assertEqual(self.files(share), {selected.name: b"recreated"})
+        self.assertEqual(selected.read_bytes(), b"recreated")
+        self.assert_private(share)
+
+    def test_single_file_root_refresh_failure_keeps_accepted_bytes(self):
+        share = self.publication(self.file)
+        accepted = share.prepare()
+        self.file.write_bytes(b"not activated")
+        with patch.object(publication.os, "replace", side_effect=OSError("activation failed")):
+            with self.assertRaisesRegex(PublicationError, "activation failed"):
+                share.prepare_request("/")
+        self.assertEqual(share.current(), accepted)
+        self.assertEqual(self.files(share), {self.file.name: b"<h1>original</h1>"})
         self.assert_private(share)
 
     def test_bundle_preserves_assets_and_excludes_metadata_recursively(self):

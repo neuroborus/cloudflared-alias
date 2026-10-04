@@ -287,7 +287,7 @@ class MCPTests(MCPFixture):
                 self.assertEqual(default["source"], {"type": "file", "path": str(self.page)})
                 self.assertEqual(default["update_mode"], "live")
                 self.assertRegex(default["url"],
-                                 r"^https://example\.test/[a-f0-9]{32}/preview%20%23%C3%A9\.html$")
+                                 r"^https://example\.test/[a-f0-9]{32}/$")
                 self.assertEqual(default["source_revision"], hashlib.sha256(self.page.read_bytes()).hexdigest())
                 self.assertRegex(default["revision"], r"^[a-f0-9]{64}$")
                 public = self.runtime / "publications" / default["id"] / "public"
@@ -300,7 +300,7 @@ class MCPTests(MCPFixture):
                 snapshot = await self.call(client, "expose_files", {
                     "path": str(self.page), "url_mode": "no-key", "update_mode": "snapshot",
                 })
-                self.assertEqual(snapshot["url"], "https://example.test/preview%20%23%C3%A9.html")
+                self.assertEqual(snapshot["url"], "https://example.test/")
                 self.assertEqual(snapshot["update_mode"], "snapshot")
             self.assertEqual(len(self.helpers), 2)
             self.assertTrue(all(running(pid) for pid in self.helpers))
@@ -325,7 +325,7 @@ class MCPTests(MCPFixture):
                 self.assertEqual(file_share["source"], {"type": "file", "path": str(self.page)})
                 self.assertEqual(port_share["source"], {"type": "port", "port": 3000})
                 self.assertNotEqual(file_share["id"], port_share["id"])
-                self.assertEqual(file_share["url"], "https://example.test/files/preview%20%23%C3%A9.html")
+                self.assertEqual(file_share["url"], "https://example.test/files/")
                 self.assertEqual(port_share["url"], "https://example.test/backend/")
                 listing = await self.call(client, "list_shares")
                 self.assertEqual({share["id"] for share in listing["shares"]},
@@ -389,7 +389,7 @@ class MCPTests(MCPFixture):
                 files = await self.call(client, "expose_files", {
                     "path": "site/preview #é.html", "update_mode": "snapshot", "key": "null",
                 })
-                self.assertEqual(files["url"], "https://example.test/null/preview%20%23%C3%A9.html")
+                self.assertEqual(files["url"], "https://example.test/null/")
                 await self.call(client, "stop_share", {"id": files["id"]})
                 generated = await self.call(client, "expose_port", {"port": 3000, "key": None})
                 self.assertRegex(generated["url"], r"^https://example\.test/[a-f0-9]{32}/$")

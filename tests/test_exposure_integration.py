@@ -135,7 +135,7 @@ os.execv({caddy!r}, [{caddy!r}, *sys.argv[1:]])
 
     def route(self, share):
         url = urlsplit(share["url"])
-        base = url.path if share["source"]["type"] != "file" else url.path.rsplit("/", 1)[0] + "/"
+        base = url.path if url.path.endswith("/") else url.path.rsplit("/", 1)[0] + "/"
         return int(share["id"].split(".", 1)[0]), url.hostname, base
 
     def request(self, share, path="", *, host=None, keyed=True, method="GET"):
@@ -169,7 +169,8 @@ os.execv({caddy!r}, [{caddy!r}, *sys.argv[1:]])
     def assert_content(self, share, path, expected):
         status, headers, body = self.request(share, path)
         self.assertEqual(status, 200, body)
-        if share["update_mode"] == "live" and Path(path or "index.html").suffix.lower() in {".html", ".htm"}:
+        filename = path or (share["source"]["path"] if share["source"]["type"] == "file" else "index.html")
+        if share["update_mode"] == "live" and Path(filename).suffix.lower() in {".html", ".htm"}:
             self.assertEqual(injected_config(body), {"revision": self.current(share).revision,
                                                     "events": self.route(share)[2] + "__alias/events"})
             self.assertEqual(strip_reload(body), expected)
@@ -295,13 +296,15 @@ os.execv({caddy!r}, [{caddy!r}, *sys.argv[1:]])
                             selected.write_bytes(original)
                             share = await self.expose(client, path="site/" + selected.name, update=update, mode=mode)
                             filename = quote(selected.name, safe="")
-                            self.assertTrue(share["url"].endswith("/" + filename))
+                            self.assertTrue(share["url"].endswith("/"))
                             self.assertEqual(share["source_revision"], hashlib.sha256(original).hexdigest())
                             identities = self.identities(share)
                             self.assertEqual(self.assert_content(share, filename, original)["Content-Type"], "application/pdf")
+                            self.assertEqual(self.assert_content(share, "", original)["Content-Disposition"],
+                                             "inline; filename*=UTF-8''" + filename)
                             accepted = self.current(share)
                             self.page.write_bytes(b"unselected sibling edit")
-                            for name in ("", "index.html", "style.css", "assets/image.svg"):
+                            for name in ("index.html", "style.css", "assets/image.svg"):
                                 self.assertEqual(self.request(share, name)[0], 404, name)
                             self.assertEqual(self.current(share), accepted)
                             replacement = self.project / "atomic-save"
@@ -310,6 +313,7 @@ os.execv({caddy!r}, [{caddy!r}, *sys.argv[1:]])
                             if update == "live":
                                 self.wait_source(share, hashlib.sha256(changed).hexdigest())
                             expected = original if update == "snapshot" else changed
+                            self.assert_content(share, "", expected)
                             self.assert_content(share, filename, expected)
                             self.assertEqual(self.current(share).source_revision, hashlib.sha256(expected).hexdigest())
                             self.assertEqual([path.name for path in (self.publication(share) / "public").iterdir()],
@@ -317,6 +321,56 @@ os.execv({caddy!r}, [{caddy!r}, *sys.argv[1:]])
                             self.assertEqual(selected.read_bytes(), changed)
                             self.assert_identities(identities)
                             await self.call(client, "stop_share", {"id": share["id"]})
+        self.run_client(body)
+
+    def test_standalone_live_html_root_sse_reload_and_descriptor_consistency(self):
+        selected = self.site / "standalone ?#é.htm"
+        original = b"<!doctype html><h1>original standalone page</h1>"
+        changed = b"<!doctype html><h1>changed standalone page</h1>"
+
+        async def body():
+            async with self.client() as client:
+                for mode in ("path", "subdomain", "no-key"):
+                    with self.subTest(mode=mode):
+                        selected.write_bytes(original)
+                        share = await self.expose(client, path=str(selected), mode=mode, key="html-test")
+                        expected = {"path": "https://example.test/html-test/",
+                                    "subdomain": "https://html-test.example.test/",
+                                    "no-key": "https://example.test/"}[mode]
+                        self.assertEqual(share["url"], expected)
+                        self.assertEqual(self.assert_content(share, "", original)["Content-Type"].split(";")[0],
+                                         "text/html")
+                        browser = self.browser(self.request(share)[2], share["url"])
+                        with self.events(share) as response:
+                            initial = read_revision(response)["revision"]
+                            self.browser_revision(browser, initial)
+                            self.assertEqual(browser.eval("browser.reloads"), 0)
+                            selected.write_bytes(changed)
+                            updated = self.wait_source(share, hashlib.sha256(changed).hexdigest())
+                            self.assertEqual(read_revision(response)["revision"], updated.revision)
+                            self.browser_revision(browser, updated.revision)
+                            self.assertEqual(browser.eval("browser.reloads"), 1)
+                            self.assert_content(share, "", changed)
+                            self.assert_content(share, quote(selected.name, safe=""), changed)
+                        fresh = self.browser(self.request(share)[2], share["url"])
+                        self.browser_revision(fresh, updated.revision)
+                        self.assertEqual(fresh.eval("browser.reloads"), 0)
+                        time.sleep(0.2)
+                        generation = (self.publication(share) / "public").readlink()
+                        (self.site / "unselected.txt").write_bytes(b"private sibling edit")
+                        self.request(share)
+                        time.sleep(0.3)
+                        self.assertEqual(self.current(share), updated)
+                        self.assertEqual((self.publication(share) / "public").readlink(), generation)
+                        self.assertEqual(selected.read_bytes(), changed)
+                        self.assertEqual([path.name for path in (self.publication(share) / "public").iterdir()],
+                                         [selected.name])
+                        self.assertEqual(self.request(share, "unselected.txt")[0], 404)
+                        listing = (await self.call(client, "list_shares"))["shares"]
+                        self.assertEqual(listing, [share | {"source_revision": updated.source_revision,
+                                                         "revision": updated.revision}])
+                        stopped = await self.call(client, "stop_share", {"id": share["id"]})
+                        self.assertEqual(stopped["url"], expected)
         self.run_client(body)
 
     def test_native_membership_revisions_sse_ordering_and_browser_lifecycle(self):

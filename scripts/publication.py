@@ -16,7 +16,7 @@ import stat
 import tempfile
 import threading
 from typing import Literal
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PREPARATION_VERSION = "copy-v1"
@@ -119,6 +119,29 @@ def effective_revision(source_revision: str, preparation_version: str) -> str:
     encoded = json.dumps([preparation_version, source_revision],
                          separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def caddy_file_handler(config: dict, *, fallback: bool = False) -> str:
+    """Route the root to the sole managed file, retaining filename aliases."""
+    if config.get("source_type") != "file" or config.get("file_routing") != "root":
+        return ""
+    filename = quote(Path(config["source"]).name, safe="")
+    # Root rewrites must not redirect when the filename equals the key. The
+    # fallback serves accepted copies with a success status inside the error route.
+    status = "        status 200\n" if fallback else ""
+    return ("header {\n"
+            f'    Content-Disposition "inline; filename*=UTF-8\'\'{filename}"\n'
+            "    match status 2xx\n"
+            "    defer\n"
+            "}\n"
+            "route / {\n"
+            f"    rewrite * /{filename}\n"
+            "    file_server {\n"
+            "        disable_canonical_uris\n"
+            f"{status}"
+            "        pass_thru\n"
+            "    }\n"
+            "}")
 
 
 def current_publication(state_dir: Path) -> PreparedPublication | None:
@@ -350,8 +373,13 @@ class Publication:
                 or any(part in (".", "..", CONTROL_PATH) or _excluded(part)
                        for part in parts)):
             raise InvalidRequest("Path is outside the public selection")
-        if self.selection.kind == "file" and parts != [self.selection.path.name]:
-            raise InvalidRequest("Only the selected file is published")
+        trailing_slash = decoded.endswith("/")
+        if self.selection.kind == "file":
+            if decoded == "/":
+                parts = [self.selection.path.name]
+                trailing_slash = False
+            elif parts != [self.selection.path.name]:
+                raise InvalidRequest("Only the selected file is published")
 
         with self._request_lock:
             previous = self._generation()
@@ -364,7 +392,7 @@ class Publication:
                     shutil.copytree(previous / "public", public, copy_function=os.link)
                     metadata = json.loads((previous / "metadata.json").read_text(encoding="utf-8"))
                     manifest = dict(metadata["manifest"])
-                    self._refresh_requested(parts, decoded.endswith("/"), public, manifest)
+                    self._refresh_requested(parts, trailing_slash, public, manifest)
                     source_revision = (manifest.get(self.selection.path.name)
                                        if self.selection.kind == "file"
                                        else bundle_revision(list(manifest.items())))
@@ -669,9 +697,11 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["select", "init", "prepare", "serve-manual", "serve-live"])
+    parser.add_argument("command", choices=["select", "init", "caddy-file-handler", "prepare",
+                                           "serve-manual", "serve-live"])
     parser.add_argument("values", nargs="*")
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--fallback", action="store_true")
     arguments = parser.parse_args()
     if arguments.command == "select":
         source, = arguments.values
@@ -687,11 +717,15 @@ def main() -> None:
             "source": str(publication.selection.path), "source_type": publication.selection.kind,
             "share_id": share_id, "project_root": str(publication.project_root),
             "update_mode": update_mode, "event_url": event_url, "port": int(port),
+            **({"file_routing": "root"} if publication.selection.kind == "file" else {}),
         }), encoding="utf-8")
         return
     # Retain the internal positional form used by direct helper callers.
     config_path = arguments.config or Path(arguments.values[0])
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if arguments.command == "caddy-file-handler":
+        print(caddy_file_handler(config, fallback=arguments.fallback))
+        return
     publication = Publication(config["source"], config["share_id"],
                               project_root=Path(config["project_root"]))
     if publication.selection.kind != config.get("source_type", publication.selection.kind):

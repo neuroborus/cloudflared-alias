@@ -21,7 +21,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import publication
-from publication import InvalidRequest, Publication, PublicationError
+from publication import caddy_file_handler, InvalidRequest, Publication, PublicationError
 
 
 def free_port():
@@ -77,23 +77,25 @@ class FileHTTPFixture:
 
     @contextmanager
     def serve(self, source=None, update="snapshot", mode="path", *,
-              helper_available=True, with_events=False, events_blocked=False):
+              helper_available=True, with_events=False, events_blocked=False, legacy=False):
         self.sequence += 1
         share = Publication(source or self.source, f"http-{self.sequence}",
                             project_root=self.project)
         share.prepare()
+        managed = {"source": str(share.selection.path), "source_type": share.selection.kind}
+        if not legacy and share.selection.kind == "file":
+            managed["file_routing"] = "root"
         with ExitStack() as cleanup:
             preparation = ""
             event_handler = ""
             if update in ("manual", "live"):
                 helper_port = free_port()
                 config = share.state_dir / "helper.json"
-                config.write_text(json.dumps({"source": str(share.selection.path),
-                                              "share_id": share.state_dir.name,
-                                              "project_root": str(self.project),
-                                              "port": helper_port,
-                                              "event_url": ("/test-key" if mode == "path" else "")
-                                              + "/__alias/events"}))
+                config.write_text(json.dumps(managed | {
+                    "share_id": share.state_dir.name, "project_root": str(self.project),
+                    "port": helper_port,
+                    "event_url": ("/test-key" if mode == "path" else "") + "/__alias/events",
+                }))
                 log = share.state_dir / "helper.log"
                 output = cleanup.enter_context(log.open("wb"))
                 helper = subprocess.Popen([sys.executable, str(self.project / "scripts/publication.py"),
@@ -124,7 +126,9 @@ class FileHTTPFixture:
                             "__PUBLIC_ROOT__": str(share.public_root),
                             "__CACHE_POLICY__": 'header >Cache-Control "no-store"' if update != "snapshot" else "",
                             "__PREPARATION_HANDLER__": preparation,
-                            "__EVENT_HANDLER__": event_handler}
+                            "__EVENT_HANDLER__": event_handler,
+                            "__FILE_HANDLER__": caddy_file_handler(managed),
+                            "__FALLBACK_FILE_HANDLER__": caddy_file_handler(managed, fallback=True)}
             for token, value in replacements.items():
                 template = template.replace(token, value)
             config = share.state_dir / "Caddyfile"
@@ -140,10 +144,11 @@ class FileHTTPFixture:
             if update in ("manual", "live") and not helper_available:
                 stop_process(helper)
 
-            def request(path="/", *, host=None, keyed=True, method="GET"):
+            def request(path="/", *, host=None, keyed=True, method="GET", headers=None):
                 if mode == "path" and keyed:
                     path = "/test-key" + path
-                headers = {"Host": host or ("test-key.example.test" if mode == "subdomain" else "example.test")}
+                headers = (headers or {}) | {
+                    "Host": host or ("test-key.example.test" if mode == "subdomain" else "example.test")}
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 try:
                     connection.request(method, path, headers=headers)
@@ -187,20 +192,33 @@ class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
                     self.assertEqual(request("/")[::2], (200, b"<h1>changed</h1>"))
                     self.assertNotEqual(share.current(), accepted)
 
-    def test_single_file_url_is_encoded_and_exposes_no_siblings(self):
+    def test_single_file_root_and_encoded_alias_expose_no_siblings(self):
         selected = self.source / "report ü space.pdf"
         selected.write_bytes(b"%PDF-1.7\nselected")
         (self.source / "secret.txt").write_text("never selected")
         for update in ("snapshot", "manual"):
             for mode in ("path", "subdomain", "no-key"):
                 with self.subTest(update=update, mode=mode), self.serve(selected, update, mode) as (_, request):
-                    status, headers, body = request("/" + quote(selected.name))
-                    self.assertEqual((status, body), (200, selected.read_bytes()))
-                    self.assertEqual(headers["Content-Type"], "application/pdf")
-                    if update == "manual":
-                        self.assertEqual(headers["Cache-Control"], "no-store")
-                    for path in ("/", "/index.html", "/secret.txt"):
+                    for path in ("/", "/?refresh=%23%25", "/" + quote(selected.name)):
+                        status, headers, body = request(path)
+                        self.assertEqual((status, body), (200, selected.read_bytes()))
+                        self.assertEqual(headers["Content-Type"], "application/pdf")
+                        self.assertEqual(headers["Content-Disposition"],
+                                         "inline; filename*=UTF-8''" + quote(selected.name, safe=""))
+                        if update == "manual":
+                            self.assertEqual(headers["Cache-Control"], "no-store")
+                        self.assertEqual(request(path, method="HEAD")[::2], (200, b""))
+                    for path in ("/index.html", "/secret.txt"):
                         self.assertEqual(request(path)[0], 404, path)
+                    # Caddy rejects paths beneath a regular file as bad requests;
+                    # manual preparation rejects them before reaching Caddy.
+                    self.assertEqual(request("/" + quote(selected.name) + "/extra")[::2],
+                                     (404 if update == "manual" else 400, b""))
+                    self.assertEqual(request("/", method="POST")[0], 405)
+                    if mode == "path":
+                        for query in ("", "?refresh=%23%25"):
+                            status, headers, _ = request("/test-key" + query, keyed=False)
+                            self.assertEqual((status, headers["Location"]), (308, "/test-key/" + query))
                     status, headers, _ = request("/" + quote(selected.name) + "/?refresh=%23%25")
                     self.assertNotEqual(status, 200)
                     if update == "snapshot" and mode == "path":
@@ -210,6 +228,82 @@ class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
                         self.assertEqual(request(headers["Location"], keyed=False)[::2],
                                          (200, selected.read_bytes()))
                     self.assertEqual(request("/" + quote(selected.name), method="HEAD")[::2], (200, b""))
+
+    def test_root_formats_and_escaped_filenames_keep_mime_and_source_bytes(self):
+        formats = {
+            "page ?#%*[]{}\"'é.html": (b"<h1>standalone</h1>", "text/html"),
+            "picture.svg": (b"<svg/>", "image/svg+xml"),
+            "data.json": (b'{"ok":true}', "application/json"),
+            "style.css": (b"h1{}", "text/css"),
+            "archive.zip": (b"PK\x03\x04\x00\xff", "application/zip"),
+            "notes.txt": (b"plain text", "text/plain"),
+        }
+        for name, (content, mime) in formats.items():
+            selected = self.source / name
+            selected.write_bytes(content)
+            for update in ("snapshot", "manual"):
+                with self.subTest(name=name, update=update), self.serve(selected, update) as (share, request):
+                    for path in ("/", "/" + quote(name, safe="")):
+                        status, headers, body = request(path)
+                        self.assertEqual((status, body), (200, content))
+                        self.assertEqual(headers["Content-Type"].split(";")[0], mime)
+                        self.assertEqual(headers["Content-Disposition"],
+                                         "inline; filename*=UTF-8''" + quote(name, safe=""))
+                    self.assertEqual(selected.read_bytes(), content)
+                    self.assertEqual(list(share.public_root.iterdir()), [share.public_root / name])
+                    self.assertEqual(request("/index.html")[0], 404)
+                    self.assertEqual(request("/__alias/events")[0], 404)
+
+    def test_single_file_root_preserves_range_and_conditional_statuses(self):
+        selected = self.source / "report.pdf"
+        selected.write_bytes(b"%PDF-1.7\n0123456789")
+        for update in ("snapshot", "manual", "live"):
+            for mode in ("path", "subdomain", "no-key"):
+                with self.subTest(update=update, mode=mode), self.serve(selected, update, mode) as (_, request):
+                    for path in ("/", "/report.pdf"):
+                        status, headers, body = request(path, headers={"Range": "bytes=0-3"})
+                        self.assertEqual((status, body), (206, b"%PDF"))
+                        self.assertEqual(headers["Content-Range"],
+                                         f"bytes 0-3/{len(selected.read_bytes())}")
+                        self.assertEqual(headers["Content-Type"], "application/pdf")
+                        self.assertEqual(request(path, method="HEAD", headers={"Range": "bytes=0-3"})[::2],
+                                         (206, b""))
+                        self.assertEqual(request(path, headers={"If-None-Match": "*"})[::2], (304, b""))
+                        self.assertEqual(request(path, headers={"If-Match": '"missing"'})[0], 412)
+                        self.assertEqual(request(path, headers={"Range": "bytes=999-"})[0], 416)
+
+    def test_legacy_file_routes_keep_filename_urls(self):
+        selected = self.source / "old #é.html"
+        selected.write_bytes(b"legacy page")
+        for update in ("snapshot", "manual"):
+            for mode in ("path", "subdomain", "no-key"):
+                with self.subTest(update=update, mode=mode), self.serve(
+                        selected, update, mode, legacy=True) as (_, request):
+                    self.assertEqual(request("/" + quote(selected.name, safe=""))[::2],
+                                     (200, b"legacy page"))
+                    self.assertEqual(request("/")[0], 404)
+
+    def test_single_file_snapshot_root_freezes_until_republication(self):
+        selected = self.source / "arbitrary.htm"
+        selected.write_bytes(b"old page")
+        with self.serve(selected) as (share, request):
+            accepted = share.current()
+            selected.write_bytes(b"new page")
+            self.assertEqual(request("/?refresh=1")[::2], (200, b"old page"))
+            self.assertEqual(share.current(), accepted)
+            share.prepare()
+            self.assertEqual(request("/")[::2], (200, b"new page"))
+            self.assertEqual(request("/arbitrary.htm")[::2], (200, b"new page"))
+
+    def test_file_named_like_key_keeps_the_trailing_slash_root(self):
+        selected = self.source / "test-key"
+        selected.write_bytes(b"selected file matches the route key")
+        for update, available in (("snapshot", True), ("manual", True), ("manual", False)):
+            with self.subTest(update=update, helper=available), self.serve(
+                    selected, update, helper_available=available) as (_, request):
+                self.assertEqual(request("/")[::2], (200, selected.read_bytes()))
+                self.assertNotIn("Location", request("/")[1])
+                self.assertEqual(request("/test-key")[::2], (200, selected.read_bytes()))
 
     def test_directory_assets_indexes_mime_types_and_key_rejection(self):
         archive = BytesIO()
@@ -237,6 +331,7 @@ class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
                 for name, (content, mime) in assets.items():
                     status, headers, body = request("/" + name)
                     self.assertEqual((status, body), (200, content))
+                    self.assertNotIn("Content-Disposition", headers)
                     actual_mime = headers["Content-Type"].split(";")[0]
                     if name.endswith(".js"):
                         self.assertIn(actual_mime, ("text/javascript", "application/javascript"))
@@ -288,13 +383,15 @@ class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
                 selected.write_bytes(b"%PDF-old")
                 with self.serve(selected, "manual", mode) as (share, request):
                     selected.write_bytes(b"%PDF-new")
-                    self.assertEqual(request("/report.pdf")[::2], (200, b"%PDF-new"))
+                    self.assertEqual(request("/?refresh=1")[::2], (200, b"%PDF-new"))
                     self.assertEqual(share.current().source_revision,
                                      hashlib.sha256(b"%PDF-new").hexdigest())
                     selected.unlink()
+                    self.assertEqual(request("/")[0], 404)
                     self.assertEqual(request("/report.pdf")[0], 404)
                     self.assertIsNone(share.current())
                     selected.write_bytes(b"%PDF-recreated")
+                    self.assertEqual(request("/")[::2], (200, b"%PDF-recreated"))
                     self.assertEqual(request("/report.pdf")[::2], (200, b"%PDF-recreated"))
                     self.assertIsNotNone(share.current())
 
@@ -391,6 +488,52 @@ class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
                         if failure == "server":
                             metadata.write_bytes(accepted_metadata)
                             self.assertEqual(request("/index.html")[::2], (200, b"not yet published"))
+
+    def test_manual_single_file_root_fallback_preserves_guards_and_safe_copy(self):
+        selected = self.source / "accepted ?#%é.html"
+        outside = self.root / "private.html"
+        outside.write_bytes(b"private bytes")
+        alias = "/" + quote(selected.name, safe="")
+        for failure in ("transport", "server", "symlink"):
+            for mode in ("path", "subdomain", "no-key"):
+                with self.subTest(failure=failure, mode=mode):
+                    selected.unlink(missing_ok=True)
+                    selected.write_bytes(b"accepted copy")
+                    with self.serve(selected, "manual", mode,
+                                    helper_available=failure != "transport") as (share, request):
+                        selected.write_bytes(b"new bytes")
+                        metadata = share.public_root.resolve().parent / "metadata.json"
+                        accepted_metadata = metadata.read_bytes()
+                        if failure == "server":
+                            metadata.write_bytes(b"invalid JSON")
+                        elif failure == "symlink":
+                            selected.unlink()
+                            selected.symlink_to(outside)
+                        for path in ("/?refresh=%23%25", alias):
+                            status, headers, body = request(path)
+                            self.assertEqual((status, body), (200, b"accepted copy"))
+                            self.assertEqual(headers["Cache-Control"], "no-store")
+                            self.assertEqual(headers["Content-Type"].split(";")[0], "text/html")
+                            self.assertEqual(headers["Content-Disposition"],
+                                             "inline; filename*=UTF-8''" + quote(selected.name, safe=""))
+                            self.assertEqual(request(path, method="HEAD")[::2], (200, b""))
+                        for path in ("/", alias):
+                            self.assertEqual(request(path, method="POST")[0], 405)
+                        for path in ("/index.html", "/private.html", alias + "/extra",
+                                     "/../index.html", "/%2e%2e/index.html", "/__alias",
+                                     "/__alias/prepare", "/__alias/events", "/metadata.json"):
+                            self.assertGreaterEqual(request(path)[0], 400, path)
+                        if mode == "path":
+                            self.assertEqual(request("/", keyed=False)[0], 404)
+                        if mode == "subdomain":
+                            self.assertEqual(request("/", host="wrong.example.test")[0], 404)
+                        if failure == "server":
+                            metadata.write_bytes(accepted_metadata)
+                        elif failure == "symlink":
+                            selected.unlink()
+                            selected.write_bytes(b"new bytes")
+                        if failure != "transport":
+                            self.assertEqual(request("/")[::2], (200, b"new bytes"))
 
     def test_file_server_errors_keep_their_status_codes(self):
         for update in ("snapshot", "manual"):

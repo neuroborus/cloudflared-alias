@@ -325,8 +325,9 @@ Each result belongs to its request, including concurrent exposures; no tool
 reads shared last-URL files or interactive history.
 
 Use absolute file paths for content in other projects; relative paths resolve
-from the alias installation root. Select one file to expose only that file,
-or a directory for a page with nearby assets. Shares survive
+from the alias installation root. Select one file to expose only that file at
+the returned trailing-slash root URL, regardless of its filename, or a directory
+for a page with nearby assets. Shares survive
 MCP shutdown; inspect them through either interface and stop an individual ID.
 Reusing a key or backend port replaces the corresponding existing share.
 
@@ -346,10 +347,11 @@ and publication helpers with mocked cloudflared.
 
 ### Static file shares
 
-Supply exactly one regular file or directory. A file exposes only its own bytes,
-with its filename encoded in the returned URL; a directory exposes its recursive
-static assets at a base URL. Select the directory when an HTML page needs nearby
-CSS, JavaScript or images. The launcher does not discover dependencies, execute
+Supply exactly one regular file or directory. A file exposes only its own bytes
+at the returned trailing-slash root URL, including files with names other than
+`index.html`; a directory exposes its recursive static assets at a base URL.
+Select the directory when an HTML page needs nearby CSS, JavaScript or images.
+The launcher does not discover dependencies, execute
 applications or convert formats. Symlinks, the launcher root and internal metadata
 are rejected; directory copies omit VCS and launcher metadata. Originals remain
 unchanged. The prepared interpreter and pinned dependencies are required for
@@ -379,13 +381,23 @@ site/
 
 With `example.test` as the configured hostname, the first share has base URL
 `https://example.test/release-preview/`; the selected snapshot file has URL
-`https://example.test/saved-page/index.html`. Its sibling `assets/style.css`
-is not published. Use relative asset URLs such as `assets/style.css` in path
-mode: `/assets/style.css` escapes the key prefix and is rejected. Nested pages
+`https://example.test/saved-page/`. Selecting `./site/preview.html` with key
+`html-test` likewise serves that file at `https://example.test/html-test/`.
+Its sibling `assets/style.css` is not published. Use relative asset URLs such as
+`assets/style.css` in path mode: `/assets/style.css` escapes the key prefix and
+is rejected. Nested pages
 can use `../assets/style.css`. Directory redirects retain the prefix and query.
 The subdomain example has base URL `https://site-preview.example.test/` and
 requires the existing wildcard DNS/tunnel setup described below. Bare-domain
 publishing requires the explicit `--url-mode no-key` choice.
+
+Single-file roots work for HTML, PDF, images, archives and other static formats.
+Responses keep the selected filename's MIME type and supply its encoded download
+filename without forcing a download. The original filename and bytes stay
+unchanged; only live HTML copies receive the reload script. The percent-encoded
+filename URL remains an alias to the same file. Existing managed shares without
+root routing retain their filename URLs when listed or stopped; they are not
+migrated while running. Republish to use the new root URL default.
 
 For sensitive or uncertain content, choose a cryptographically random opaque
 key without embedding sensitive details. This also supplies a fallback when

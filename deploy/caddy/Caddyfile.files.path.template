@@ -35,6 +35,7 @@
             respond @control 404
             __PREPARATION_HANDLER__
             import publication_path base
+            __FILE_HANDLER__
             file_server {
                 index index.html index.htm
             }
@@ -54,6 +55,7 @@
             @fallback_method not method GET HEAD
             respond @fallback_method 405
             import publication_path fallback_base
+            __FALLBACK_FILE_HANDLER__
             file_server {
                 index index.html index.htm
                 status 200
