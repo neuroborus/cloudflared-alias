@@ -15,6 +15,8 @@ readonly HISTORY_MAX=10
 readonly CONFIG_FILE="${ROOT_DIR}/cloudflared-alias.conf"
 readonly CF_TEMPLATE="${ROOT_DIR}/deploy/cloudflared/config.template.yml"
 readonly SHARE_CONTRACT="${ROOT_DIR}/scripts/share_contract.py"
+readonly PUBLICATION="${ROOT_DIR}/scripts/publication.py"
+readonly PUBLICATIONS_DIR="${RUNTIME_DIR}/publications"
 RUNTIME_LOCKED=0
 STRUCTURED=0
 
@@ -38,6 +40,7 @@ Usage:
   $(basename "$0") stop
   $(basename "$0") --list
   $(basename "$0") expose-port PORT [--url-mode MODE] [--key KEY]
+  $(basename "$0") expose-files PATH [--url-mode MODE] [--update-mode MODE] [--key KEY]
   $(basename "$0") list-shares
   $(basename "$0") stop-share ID
 
@@ -48,6 +51,7 @@ Modes: -p/--path | -s/--subdomain | -n/--no-key (else config DEFAULT_MODE)
 Share commands return JSON, use keyed path mode by default, and always detach.
   --url-mode      path | subdomain | no-key (explicit bare-domain access)
   --key           1–32 lowercase alphanumeric/hyphen characters; else 32 random hex.
+  --update-mode   snapshot | manual | live (default for files)
 Config: ${CONFIG_FILE}
 Environment: DEFAULT_MODE, CADDY_PORT, ID_LENGTH, DETACH, CLOUDFLARED_BASE_CONFIG,
              SUBDOMAIN_DOMAIN, TUNNEL_NAME, TUNNEL_HOSTNAME, TUNNEL_CREDENTIALS_FILE,
@@ -219,6 +223,20 @@ valid_registry_instance() {
   [[ "$REG_MODE" == path || "$REG_MODE" == subdomain || "$REG_MODE" == no-key ]] || return 1
   is_owned_process "$REG_PID" caddy "${REG_DIR}/Caddyfile"
 }
+publication_dir() {
+  local instance="$1" id="${1##*/}"
+  [[ "$instance" == "${INSTANCES_DIR}/${id}" && "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]] || return 1
+  [[ ! -L "$RUNTIME_DIR" && ! -L "$PUBLICATIONS_DIR" ]] || return 1
+  printf '%s' "${PUBLICATIONS_DIR}/${id}"
+}
+cleanup_publication() {
+  local directory pid=""
+  directory="$(publication_dir "$1")" || return 0
+  [[ -d "$directory" && ! -L "$directory" ]] || return 0
+  [[ ! -f "${directory}/helper.pid" ]] || pid="$(cat "${directory}/helper.pid")"
+  stop_process "$pid" publication.py "${directory}/helper.json"
+  rm -rf -- "$directory"
+}
 persisted_hostname() {
   local port="$1" value host
   [[ -f "$CF_CONFIG" && "$port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
@@ -288,12 +306,13 @@ prune_registry() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "$line" ]] || continue
     parse_registry "$line"
-    if valid_registry_instance; then printf '%s\n' "$line" >> "$tmp"; fi
+    if valid_registry_instance; then printf '%s\n' "$line" >> "$tmp"
+    else cleanup_publication "$REG_DIR"; fi
   done < <(read_registry)
   mv "$tmp" "$REGISTRY_FILE"
 }
 registry_conflicts() {
-  [[ "$BACKEND_PORT" == "$REG_BACKEND" || ( -n "$PATH_ID" && "$PATH_ID" == "$REG_KEY" ) || ( "$MODE" == no-key && "$REG_MODE" == no-key ) ]]
+  [[ ( "$BACKEND_PORT" != 0 && "$BACKEND_PORT" == "$REG_BACKEND" ) || ( -n "$PATH_ID" && "$PATH_ID" == "$REG_KEY" ) || ( "$MODE" == no-key && "$REG_MODE" == no-key ) ]]
 }
 registry_pending_removal() {
   if [[ -n "${STOPPING_INSTANCE_DIR:-}" ]]; then
@@ -323,6 +342,9 @@ commit_registry_update() {
       else log "Stopping previous tunnel (key=${REG_KEY:-<no-key>}, port=${REG_BACKEND}) — same key or port."; fi
       stop_process "$REG_PID" caddy "${REG_DIR}/Caddyfile"
       rm -f "${REG_DIR}/caddy.pid"
+      cleanup_publication "$REG_DIR"
+    elif ! valid_registry_instance; then
+      cleanup_publication "$REG_DIR"
     fi
   done < "$pending"
   PENDING_REGISTRY_FILE=""
@@ -341,7 +363,7 @@ port_in_use() {
   fi
 }
 next_caddy_port() {
-  local port="$CADDY_PORT" line busy
+  local port="$CADDY_PORT" line busy publication helper_port
   while (( port <= 65535 )); do
     busy=0
     # Never proxy a backend to the Caddy instance itself, including other backends.
@@ -352,6 +374,11 @@ next_caddy_port() {
       parse_registry "$line"
       [[ "$BACKEND_PORT" != "$REG_CADDY" ]] || fail "Backend port ${BACKEND_PORT} is used by a running Caddy instance."
       [[ "$port" != "$REG_CADDY" && "$port" != "$REG_BACKEND" ]] || busy=1
+      helper_port=""
+      publication="$(publication_dir "$REG_DIR")" || continue
+      [[ ! -f "${publication}/helper.port" ]] || helper_port="$(cat "${publication}/helper.port")"
+      [[ "$BACKEND_PORT" != "$helper_port" ]] || fail "Backend port ${BACKEND_PORT} is used by a publication helper."
+      [[ "$port" != "$helper_port" ]] || busy=1
     done < <(read_registry)
     if (( busy == 0 )); then printf '%s' "$port"; return 0; fi
     port=$(( port + 1 ))
@@ -370,6 +397,62 @@ render_template() {
     -e "s|__TUNNEL_NAME__|$(escape_sed "$(yaml_quote "$TUNNEL_NAME_VALUE")")|g" \
     -e "s|__CREDENTIALS_FILE__|$(escape_sed "$(yaml_quote "$CREDENTIALS_FILE_VALUE")")|g" \
     "$template" > "$output"
+}
+render_file_template() {
+  local template="$1" output="$2" content public_root cache="" prepare="" events=""
+  public_root="${CURRENT_PUBLICATION_DIR}/public"
+  [[ "$public_root" != *[$'\n\r\t{}']* ]] || fail "Unsupported launcher path for Caddy file serving."
+  public_root="${public_root//\\/\\\\}"; public_root="${public_root//\"/\\\"}"
+  if [[ "$UPDATE_MODE" != snapshot ]]; then cache='header >Cache-Control "no-store"'; fi
+  if [[ "$UPDATE_MODE" == manual ]]; then
+    prepare="forward_auth 127.0.0.1:${HELPER_PORT} {
+      uri /__alias/prepare
+      @unavailable status 5xx
+      handle_response @unavailable {
+        error \"Publication preparation unavailable\" 502
+      }
+    }"
+  elif [[ "$UPDATE_MODE" == live ]]; then
+    events="@events path /__alias/events
+    reverse_proxy @events 127.0.0.1:${HELPER_PORT} {
+      flush_interval -1
+    }"
+  fi
+  render_template "$template" "$output"
+  content="$(cat "$output")"
+  content="${content//__PUBLIC_ROOT__/"$public_root"}"
+  content="${content//__CACHE_POLICY__/"$cache"}"
+  content="${content//__PREPARATION_HANDLER__/"$prepare"}"
+  content="${content//__EVENT_HANDLER__/"$events"}"
+  printf '%s\n' "$content" > "$output"
+}
+
+start_publication() {
+  local event_url="/__alias/events" attempt
+  CURRENT_PUBLICATION_DIR="$(publication_dir "$CURRENT_INSTANCE_DIR")"
+  HELPER_PORT=0
+  if [[ "$UPDATE_MODE" != snapshot ]]; then
+    # Reserve the candidate Caddy port too; registry installation follows readiness.
+    HELPER_PORT="$(CADDY_PORT=$(( CADDY_PORT + 1 )) next_caddy_port)"
+  fi
+  [[ "$MODE" != path ]] || event_url="/${PATH_ID}${event_url}"
+  "$ALIAS_PYTHON" "$PUBLICATION" init "$FILE_SOURCE" "${CURRENT_INSTANCE_DIR##*/}" \
+    "$UPDATE_MODE" "$event_url" "$HELPER_PORT" || fail "Could not initialize the file publication."
+  if [[ "$UPDATE_MODE" == snapshot ]]; then
+    "$ALIAS_PYTHON" "$PUBLICATION" prepare --config "${CURRENT_PUBLICATION_DIR}/helper.json" \
+      > "${CURRENT_PUBLICATION_DIR}/helper.log" 2>&1 || fail "File preparation failed. Check '${CURRENT_PUBLICATION_DIR}/helper.log'."
+    return 0
+  fi
+  printf '%s\n' "$HELPER_PORT" > "${CURRENT_PUBLICATION_DIR}/helper.port"
+  start_daemon CURRENT_HELPER_PID "${CURRENT_PUBLICATION_DIR}/helper.log" \
+    "$ALIAS_PYTHON" "$PUBLICATION" "serve-${UPDATE_MODE}" --config "${CURRENT_PUBLICATION_DIR}/helper.json"
+  printf '%s\n' "$CURRENT_HELPER_PID" > "${CURRENT_PUBLICATION_DIR}/helper.pid"
+  for (( attempt=0; attempt<50; attempt++ )); do
+    is_owned_process "$CURRENT_HELPER_PID" publication.py "${CURRENT_PUBLICATION_DIR}/helper.json" || break
+    [[ ! -f "${CURRENT_PUBLICATION_DIR}/ready.json" ]] || return 0
+    sleep 0.1
+  done
+  fail "Publication helper failed to start. Check '${CURRENT_PUBLICATION_DIR}/helper.log'."
 }
 recover_shared_tunnel_identity() {
   local line SOURCE_CF_CONFIG="$CF_CONFIG"
@@ -509,6 +592,7 @@ stop_all() {
       stop_process "$REG_PID" caddy "${REG_DIR}/Caddyfile"
       rm -f "${REG_DIR}/caddy.pid"
     fi
+    cleanup_publication "$REG_DIR"
   done < <(read_registry)
   # Clean up the pre-registry layout as well, but never trust a PID alone.
   if [[ -f "${RUNTIME_DIR}/caddy/caddy.pid" ]]; then
@@ -536,6 +620,10 @@ cleanup_on_exit() {
   if [[ -n "${CURRENT_INSTANCE_DIR:-}" ]]; then
     stop_started_process "${CURRENT_CADDY_PID:-}" caddy "${CURRENT_INSTANCE_DIR}/Caddyfile"
     rm -f "${CURRENT_INSTANCE_DIR}/caddy.pid"
+    if [[ -n "${CURRENT_PUBLICATION_DIR:-}" ]]; then
+      stop_started_process "${CURRENT_HELPER_PID:-}" publication.py "${CURRENT_PUBLICATION_DIR}/helper.json"
+    fi
+    cleanup_publication "$CURRENT_INSTANCE_DIR"
   fi
   tmp="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -584,7 +672,7 @@ exit_handler() {
 }
 
 share_result() {
-  local state="${1:-active}" host="$REG_HOST" url shared_pid=""
+  local state="${1:-active}" host="$REG_HOST" url shared_pid="" directory helper_pid=""
   [[ -n "$host" ]] || host="$(persisted_hostname "$REG_CADDY")" || fail "Cannot recover hostname for share ${REG_DIR##*/}."
   validate_hostname "$host"
   url="https://${host}/"
@@ -593,7 +681,16 @@ share_result() {
     [[ ! -f "$CF_PID_FILE" ]] || shared_pid="$(cat "$CF_PID_FILE")"
     is_owned_process "$shared_pid" cloudflared "$CF_CONFIG" || state=degraded
   fi
-  "$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${REG_DIR##*/}" "$url" "$REG_BACKEND" "$REG_MODE" "$state"
+  if [[ "$REG_BACKEND" == 0 ]]; then
+    directory="$(publication_dir "$REG_DIR")" || fail "Invalid file share directory."
+    if [[ "$state" == active && -f "${directory}/helper.port" ]]; then
+      [[ ! -f "${directory}/helper.pid" ]] || helper_pid="$(cat "${directory}/helper.pid")"
+      is_owned_process "$helper_pid" publication.py "${directory}/helper.json" || state=degraded
+    fi
+    "$ALIAS_PYTHON" "$SHARE_CONTRACT" files "${REG_DIR##*/}" "$url" "$REG_MODE" "$state" "${directory}/helper.json"
+  else
+    "$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${REG_DIR##*/}" "$url" "$REG_BACKEND" "$REG_MODE" "$state"
+  fi
 }
 
 list_shares() {
@@ -745,6 +842,11 @@ run_tunnel() {
     no-key) validate_hostname "$HOSTNAME_VALUE"; template="${ROOT_DIR}/deploy/caddy/Caddyfile.path-nokey.template" ;;
     path) validate_hostname "$HOSTNAME_VALUE"; template="${ROOT_DIR}/deploy/caddy/Caddyfile.template" ;;
   esac
+  if [[ -n "${FILE_SOURCE:-}" ]]; then
+    local file_mode="$MODE"
+    [[ "$MODE" != no-key ]] || file_mode=nokey
+    template="${ROOT_DIR}/deploy/caddy/Caddyfile.files.${file_mode}.template"
+  fi
   if [[ "$MODE" != no-key ]]; then
     if [[ -n "$PATH_ID_ARG" ]]; then
       validate_key "$PATH_ID_ARG"; PATH_ID="$PATH_ID_ARG"
@@ -775,14 +877,23 @@ run_tunnel() {
   check_shared_tunnel
   CADDY_PORT="$(next_caddy_port)"
   CURRENT_INSTANCE_DIR="$(mktemp -d "${INSTANCES_DIR}/${CADDY_PORT}.XXXXXX")"
-  render_template "$template" "${CURRENT_INSTANCE_DIR}/Caddyfile"
+  if [[ -n "${FILE_SOURCE:-}" ]]; then
+    start_publication
+    render_file_template "$template" "${CURRENT_INSTANCE_DIR}/Caddyfile"
+  else
+    render_template "$template" "${CURRENT_INSTANCE_DIR}/Caddyfile"
+  fi
   log "Starting Caddy on localhost:${CADDY_PORT}"
   XDG_CONFIG_HOME="${CURRENT_INSTANCE_DIR}/config" XDG_DATA_HOME="${CURRENT_INSTANCE_DIR}/data" \
     start_daemon CURRENT_CADDY_PID "${CURRENT_INSTANCE_DIR}/caddy.log" caddy run --config "${CURRENT_INSTANCE_DIR}/Caddyfile" --adapter caddyfile
   printf '%s\n' "$CURRENT_CADDY_PID" > "${CURRENT_INSTANCE_DIR}/caddy.pid"
   is_owned_process "$CURRENT_CADDY_PID" caddy "${CURRENT_INSTANCE_DIR}/Caddyfile" || fail "Caddy failed to start. Check '${CURRENT_INSTANCE_DIR}/caddy.log'."
   if [[ "$STRUCTURED" == 1 ]]; then
-    SHARE_RESULT="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${CURRENT_INSTANCE_DIR##*/}" "$share_url" "$BACKEND_PORT" "$MODE" active)"
+    if [[ -n "${FILE_SOURCE:-}" ]]; then
+      SHARE_RESULT="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" files "${CURRENT_INSTANCE_DIR##*/}" "$share_url" "$MODE" active "${CURRENT_PUBLICATION_DIR}/helper.json")"
+    else
+      SHARE_RESULT="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" port "${CURRENT_INSTANCE_DIR##*/}" "$share_url" "$BACKEND_PORT" "$MODE" active)"
+    fi
     printf '%s\n' "$SHARE_RESULT" > "${CURRENT_INSTANCE_DIR}/share.json"
   fi
   registry_backup="$(mktemp "${RUNTIME_DIR}/registry.XXXXXX")"
@@ -794,11 +905,12 @@ run_tunnel() {
   unset REGISTRY_BEFORE_START
   printf '%s\n' "$share_url" > "${RUNTIME_DIR}/current-share-url.txt"
   printf '%s\n' "$PATH_ID" > "${RUNTIME_DIR}/current-path-id.txt"
-  add_to_history "$share_url"
+  [[ -n "${FILE_SOURCE:-}" ]] || add_to_history "$share_url"
   log "Mode            : ${MODE}"
   log "Tunnel hostname : ${ROUTE_HOST}"
   [[ "$MODE" == no-key ]] || log "Path ID         : ${PATH_ID}"
-  log "Share URL       : ${share_url}"
+  if [[ -n "${FILE_SOURCE:-}" ]]; then log "Route base URL  : ${share_url}"
+  else log "Share URL       : ${share_url}"; fi
   log "Runtime files   : ${RUNTIME_DIR}"
   log "Logs            : ${CURRENT_INSTANCE_DIR}/caddy.log, ${CF_LOG}"
   unlock_runtime
@@ -836,7 +948,7 @@ main() {
     lock_runtime; stop_all; unlock_runtime; return 0
   fi
   case "$1" in
-    expose-port|list-shares|stop-share)
+    expose-port|expose-files|list-shares|stop-share)
       STRUCTURED=1
       trap exit_handler EXIT ;;
   esac
@@ -864,12 +976,16 @@ main() {
   DETACH="${DETACH-0}"
   DEFAULT_MODE="${DEFAULT_MODE-path}"
   BACKEND_PORT=""; PATH_ID_ARG=""; MODE=""
-  if [[ "$1" == expose-port ]]; then
+  FILE_SOURCE=""; UPDATE_MODE=live
+  if [[ "$1" == expose-port || "$1" == expose-files ]]; then
+    local command="$1"
     shift
-    [[ $# -gt 0 ]] || fail "Use: $(basename "$0") expose-port PORT [--url-mode MODE] [--key KEY]"
-    BACKEND_PORT="$1"; shift
+    [[ $# -gt 0 ]] || fail "${command} requires a source. See --help."
+    if [[ "$command" == expose-files ]]; then FILE_SOURCE="$1"; BACKEND_PORT=0
+    else BACKEND_PORT="$1"; fi
+    shift
     MODE=path; DETACH=1
-    local key_given=0 mode_given=0
+    local key_given=0 mode_given=0 update_given=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --url-mode)
@@ -878,12 +994,20 @@ main() {
         --key)
           [[ $# -ge 2 && "$key_given" == 0 ]] || fail "Provide --key once with a key."
           PATH_ID_ARG="$2"; key_given=1; validate_key "$PATH_ID_ARG"; shift ;;
-        *) fail "Unknown expose-port option: '$1'." ;;
+        --update-mode)
+          [[ "$command" == expose-files && $# -ge 2 && "$update_given" == 0 ]] || fail "Provide --update-mode once for files."
+          UPDATE_MODE="$2"; update_given=1; shift ;;
+        *) fail "Unknown ${command} option: '$1'." ;;
       esac
       shift
     done
     if [[ "$MODE" != no-key && "$key_given" == 0 ]]; then
       PATH_ID_ARG="$("$ALIAS_PYTHON" "$SHARE_CONTRACT" key)"
+    fi
+    if [[ "$command" == expose-files ]]; then
+      case "$UPDATE_MODE" in snapshot|manual|live) ;; *) fail "Invalid file update mode: '${UPDATE_MODE}'." ;; esac
+      [[ -n "$FILE_SOURCE" && "$FILE_SOURCE" != *[$'\n\r\t']* ]] || fail "Provide one single-line file or directory path."
+      FILE_SOURCE="$("$ALIAS_PYTHON" "$PUBLICATION" select -- "$FILE_SOURCE")" || fail "Invalid file selection."
     fi
   elif [[ "$1" == --list || "$1" == -l ]]; then
     [[ $# -eq 1 ]] || fail "Use: $(basename "$0") --list (no port)."
@@ -908,7 +1032,7 @@ main() {
   case "$MODE" in path|subdomain|no-key) ;; *) fail "Invalid DEFAULT_MODE or mode: '${MODE}'. Use path, subdomain, or no-key." ;; esac
   [[ -n "$BACKEND_PORT" ]] || fail "Backend port required."
   [[ "$MODE" != no-key || -z "$PATH_ID_ARG" ]] || fail "Cannot use no-key mode and a key together."
-  validate_number 'backend port' "$BACKEND_PORT" 65535
+  [[ -n "$FILE_SOURCE" ]] || validate_number 'backend port' "$BACKEND_PORT" 65535
   validate_number CADDY_PORT "$CADDY_PORT" 65535
   if [[ "$STRUCTURED" != 1 ]]; then
     validate_number ID_LENGTH "$ID_LENGTH" 32

@@ -3,7 +3,9 @@
 import json
 import secrets
 import sys
+from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
+from urllib.parse import quote
 
 UrlMode = Literal["path", "subdomain", "no-key"]
 UpdateMode = Literal["snapshot", "manual", "live"]
@@ -52,6 +54,22 @@ def port_share(share_id: str, url: str, port: int, mode: UrlMode,
             "url_mode": mode, "update_mode": None, "state": state}
 
 
+def file_share(share_id: str, url: str, mode: UrlMode, state: ShareState,
+               config_path: str) -> ShareResult:
+    from publication import current_publication
+
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    source: FileSource = {"type": config["source_type"], "path": config["source"]}
+    if source["type"] == "file":
+        url += quote(Path(source["path"]).name, safe="")
+    result: ShareResult = {"id": share_id, "url": url, "source": source,
+                          "url_mode": mode, "update_mode": config["update_mode"], "state": state}
+    prepared = current_publication(Path(config_path).parent)
+    if prepared is not None:
+        result.update(source_revision=prepared.source_revision, revision=prepared.revision)
+    return result
+
+
 def main() -> None:
     command, *arguments = sys.argv[1:]
     if command == "key":
@@ -60,6 +78,8 @@ def main() -> None:
     if command == "port":
         share_id, url, port, mode, state = arguments
         result = port_share(share_id, url, int(port), mode, state)
+    elif command == "files":
+        result = file_share(*arguments)
     elif command == "collect":
         result = [json.loads(line) for line in sys.stdin if line.strip()]
     elif command == "error":

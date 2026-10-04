@@ -121,6 +121,27 @@ def effective_revision(source_revision: str, preparation_version: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def current_publication(state_dir: Path) -> PreparedPublication | None:
+    """Inspect accepted metadata without reopening a possibly missing source."""
+    for _ in range(3):
+        try:
+            target = os.readlink(state_dir / "public")
+        except FileNotFoundError:
+            return None
+        if not re.fullmatch(r"generation-[a-zA-Z0-9_]+/public", target):
+            raise PublicationError("Unexpected managed publication root")
+        try:
+            result = json.loads((state_dir / Path(target).parent / "metadata.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            if target == os.readlink(state_dir / "public"):
+                raise
+            continue
+        if result["source_revision"] is None:
+            return None
+        return PreparedPublication(result["source_revision"], result["revision"])
+    raise PublicationError("Publication changed while reading its revision")
+
+
 class _ReloadInsertion(HTMLParser):
     """Find body end tags outside raw text, comments and inert templates."""
 
@@ -243,20 +264,7 @@ class Publication:
         return self.state_dir / Path(target).parent
 
     def current(self) -> PreparedPublication | None:
-        for _ in range(3):
-            generation = self._generation()
-            if generation is None:
-                return None
-            try:
-                result = json.loads((generation / "metadata.json").read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                if generation == self._generation():
-                    raise
-                continue  # Live activation cleaned up the previous generation.
-            if result["source_revision"] is None:
-                return None  # A manual standalone-file request accepted its deletion.
-            return PreparedPublication(result["source_revision"], result["revision"])
-        raise PublicationError("Publication changed while reading its revision")
+        return current_publication(self.state_dir)
 
     def prepare(self, *, attempts: int = 3, event_url: str | None = None) -> PreparedPublication:
         if not 1 <= attempts <= 3:
@@ -659,25 +667,64 @@ def live_app(live: LivePublication, *, heartbeat: float = 15):
 
 def main() -> None:
     import argparse
-    import uvicorn
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["serve-manual", "serve-live"])
-    parser.add_argument("config", type=Path)
+    parser.add_argument("command", choices=["select", "init", "prepare", "serve-manual", "serve-live"])
+    parser.add_argument("values", nargs="*")
+    parser.add_argument("--config", type=Path)
     arguments = parser.parse_args()
-    config = json.loads(arguments.config.read_text(encoding="utf-8"))
+    if arguments.command == "select":
+        source, = arguments.values
+        print(select_source(source).path)
+        return
+    if arguments.command == "init":
+        source, share_id, update_mode, event_url, port = arguments.values
+        if update_mode not in ("snapshot", "manual", "live"):
+            parser.error("Invalid update mode")
+        publication = Publication(source, share_id)
+        publication._ensure_state()
+        (publication.state_dir / "helper.json").write_text(json.dumps({
+            "source": str(publication.selection.path), "source_type": publication.selection.kind,
+            "share_id": share_id, "project_root": str(publication.project_root),
+            "update_mode": update_mode, "event_url": event_url, "port": int(port),
+        }), encoding="utf-8")
+        return
+    # Retain the internal positional form used by direct helper callers.
+    config_path = arguments.config or Path(arguments.values[0])
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    publication = Publication(config["source"], config["share_id"],
+                              project_root=Path(config["project_root"]))
+    if publication.selection.kind != config.get("source_type", publication.selection.kind):
+        raise PublicationError("Selected source type changed during startup")
+    if arguments.command == "prepare":
+        publication.prepare()
+        return
     port = config["port"]
     if type(port) is not int or not 1 <= port <= 65535:
         parser.error("Helper port must be between 1 and 65535")
-    publication = Publication(config["source"], config["share_id"],
-                              project_root=Path(config["project_root"]))
+    import uvicorn
+
     if arguments.command == "serve-live":
         app = live_app(LivePublication(publication, event_url=config.get("event_url", "/__alias/events")))
     else:
         if publication._generation() is None:
             publication.prepare()
         app = manual_app(publication)
-    uvicorn.run(app, host="127.0.0.1", port=port, access_log=False)
+    ready = config_path.with_name("ready.json")
+
+    class ReadyServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets)
+            if self.started:
+                pending = ready.with_suffix(".tmp")
+                pending.write_text(json.dumps({"pid": os.getpid(), "port": port}))
+                os.replace(pending, ready)
+
+    ready.unlink(missing_ok=True)
+    try:
+        ReadyServer(uvicorn.Config(app, host="127.0.0.1", port=port, access_log=False)).run()
+    finally:
+        ready.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

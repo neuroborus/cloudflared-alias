@@ -9,11 +9,12 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 from test_tunnel import DAEMON, TunnelFixture, running
 
 
-class ShareTests(TunnelFixture):
+class ShareFixture(TunnelFixture):
     def setUp(self):
         super().setUp()
         self.env["ALIAS_PYTHON"] = sys.executable
@@ -45,6 +46,8 @@ class ShareTests(TunnelFixture):
         self.assertFalse(list(self.runtime.glob("registry.*")))
         self.assertFalse(list((self.runtime / "cloudflared").glob("refresh.*")))
 
+
+class ShareTests(ShareFixture):
     def test_empty_listing_and_unknown_id_do_not_create_runtime(self):
         self.source.unlink()
         self.assertEqual(self.success("list-shares"), [])
@@ -394,3 +397,308 @@ os.execv({real_flock!r}, ['flock', *arguments])
         self.assertEqual(len(self.success("list-shares")), 1)
         self.env.pop("ALIAS_PYTHON")
         self.failure("list-shares")
+
+
+class FileShareTests(ShareFixture):
+    def setUp(self):
+        self.helpers = []
+        super().setUp()
+        # The Caddy daemon remains synthetic, but real helper listeners need
+        # actual port inspection, including other helpers started by this test.
+        (self.project / "bin/ss").write_text('''#!/usr/bin/env python3
+from pathlib import Path
+import re
+import sys
+port = int(re.search(r":([0-9]+)", sys.argv[-1])[1])
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    for row in Path(table).read_text().splitlines()[1:]:
+        fields = row.split()
+        if fields[3] == "0A" and int(fields[1].split(":")[1], 16) == port:
+            print("occupied")
+''')
+        self.content = self.project / "site"
+        self.content.mkdir()
+        self.page = self.content / "preview #é.html"
+        self.page.write_bytes(b"<h1>initial</h1>")
+        (self.content / "style.css").write_bytes(b"body { color: red }")
+
+    def success(self, *arguments):
+        result = super().success(*arguments)
+        # Retain only exact test-owned PIDs, including deliberately corrupted rows.
+        for path in self.runtime.glob("publications/*/helper.pid"):
+            pid = int(path.read_text())
+            if pid not in self.helpers:
+                self.helpers.append(pid)
+        return result
+
+    def stop_test_processes(self):
+        try:
+            super().stop_test_processes()
+        finally:
+            for pid in self.helpers:
+                if running(pid):
+                    os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while any(running(pid) for pid in self.helpers) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            for pid in self.helpers:
+                if running(pid):
+                    os.kill(pid, signal.SIGKILL)
+
+    def publication(self, share):
+        return self.runtime / "publications" / share["id"]
+
+    def test_file_arguments_fail_before_creating_runtime(self):
+        for arguments in (
+            (), ("",), (str(self.page), "--update-mode"),
+            (str(self.page), "--update-mode", "unknown"),
+            (str(self.page), "--update-mode", "manual", "--update-mode", "live"),
+            (str(self.page), "--url-mode", "no-key", "--key", "key"),
+            (str(self.page), "extra"), (str(self.project),), ("/",),
+            (str(self.content / "missing"),),
+        ):
+            with self.subTest(arguments=arguments):
+                self.failure("expose-files", *arguments)
+                self.assertFalse(self.runtime.exists())
+        link = self.content / "link"
+        link.symlink_to(self.page)
+        self.failure("expose-files", str(link))
+        self.assertFalse(self.runtime.exists())
+
+    def test_snapshot_encodes_single_file_url_and_freezes_only_selected_bytes(self):
+        share = self.success("expose-files", str(self.page), "--update-mode", "snapshot", "--key", "preview")
+        self.assertEqual(share["url"], "https://example.test/preview/" + quote(self.page.name, safe=""))
+        self.assertEqual(share["source"], {"type": "file", "path": str(self.page)})
+        self.assertEqual((share["url_mode"], share["update_mode"], share["state"]),
+                         ("path", "snapshot", "active"))
+        self.assertRegex(share["source_revision"], r"^[a-f0-9]{64}$")
+        directory = self.publication(share)
+        public = directory / "public"
+        self.assertEqual([path.name for path in public.iterdir()], [self.page.name])
+        self.assertFalse((directory / "helper.pid").exists())
+        config = next(self.runtime.glob("instances/*/Caddyfile")).read_text()
+        self.assertIn(str(public), config)
+        self.assertNotIn(str(self.content), config)
+        self.assertNotIn("__PUBLIC_ROOT__", config)
+        self.page.write_bytes(b"changed")
+        self.assertEqual((public / self.page.name).read_bytes(), b"<h1>initial</h1>")
+        self.page.unlink()
+        self.assertEqual(self.success("list-shares"), [share])
+        self.assertEqual(self.success("stop-share", share["id"]), share | {"state": "stopped"})
+        self.assertFalse(directory.exists())
+        self.assertTrue((self.content / "style.css").exists())
+        self.assertFalse((self.runtime / "tunnel-history").exists())
+
+    def test_failed_snapshot_replacement_preserves_accepted_copy_and_processes(self):
+        share = self.success("expose-files", str(self.content), "--update-mode", "snapshot", "--key", "keep")
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)]
+        self.page.write_bytes(b"new source")
+        (self.content / "unsafe").symlink_to(self.page)
+        self.failure("expose-files", str(self.content), "--update-mode", "snapshot", "--key", "keep")
+        self.assert_preserved(snapshot, pids)
+        self.assertEqual(self.success("list-shares"), [share])
+        self.assertEqual((self.publication(share) / "public" / self.page.name).read_bytes(), b"<h1>initial</h1>")
+        self.assertEqual([path.name for path in (self.runtime / "publications").iterdir()], [share["id"]])
+
+    def test_all_update_modes_and_url_modes_have_owned_independent_state(self):
+        for update in ("snapshot", "manual", "live"):
+            for mode in ("path", "subdomain", "no-key"):
+                with self.subTest(update=update, mode=mode):
+                    args = () if mode == "no-key" else ("--key", "files")
+                    share = self.success("expose-files", str(self.content), "--update-mode", update,
+                                         "--url-mode", mode, *args)
+                    host = "files.example.test" if mode == "subdomain" else "example.test"
+                    base = "/files/" if mode == "path" else "/"
+                    self.assertEqual(share["url"], f"https://{host}{base}")
+                    self.assertEqual(share["source"], {"type": "directory", "path": str(self.content)})
+                    self.assertEqual(share["update_mode"], update)
+                    directory = self.publication(share)
+                    config = json.loads((directory / "helper.json").read_text())
+                    self.assertEqual(config["event_url"], base + "__alias/events")
+                    caddyfile = (Path(self.registry()[0][5]) / "Caddyfile").read_text()
+                    self.assertNotIn("__CACHE_POLICY__", caddyfile)
+                    self.assertEqual('header >Cache-Control "no-store"' in caddyfile, update != "snapshot")
+                    self.assertEqual("forward_auth" in caddyfile, update == "manual")
+                    self.assertEqual("reverse_proxy @events" in caddyfile, update == "live")
+                    if update != "snapshot":
+                        pid = int((directory / "helper.pid").read_text())
+                        self.assertEqual(json.loads((directory / "ready.json").read_text())["pid"], pid)
+                        self.assertTrue(running(pid))
+                        # Reading/listing after the launcher exited also verifies its lock was closed.
+                    self.assertEqual(self.success("list-shares"), [share])
+                    self.success("stop-share", share["id"])
+                    self.assertFalse(directory.exists())
+                    self.assertFalse(any(running(pid) for pid in self.helpers))
+
+    def test_default_live_updates_without_restarting_daemons_or_mutating_sources(self):
+        self.env.update(DEFAULT_MODE="no-key", DETACH="0", ID_LENGTH="invalid")
+        share = self.success("expose-files", str(self.content))
+        self.assertEqual(share["update_mode"], "live")
+        self.assertRegex(share["url"], r"^https://example\.test/[a-f0-9]{32}/$")
+        directory = self.publication(share)
+        helper = int((directory / "helper.pid").read_text())
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)]
+        replacement = self.content / "editor-save"
+        replacement.write_bytes(b"<h1>updated</h1>")
+        replacement.replace(self.page)
+        deadline = time.monotonic() + 5
+        updated = share
+        while time.monotonic() < deadline:
+            updated = self.success("list-shares")[0]
+            if updated["revision"] != share["revision"]:
+                break
+            time.sleep(0.02)
+        self.assertNotEqual(updated["revision"], share["revision"])
+        self.assertIn(b"<h1>updated</h1>", (directory / "public" / self.page.name).read_bytes())
+        self.assertIn(b"data-alias-reload", (directory / "public" / self.page.name).read_bytes())
+        self.assertEqual(self.page.read_bytes(), b"<h1>updated</h1>")
+        self.assert_preserved(snapshot, [helper, *pids])
+        self.assertEqual(int((directory / "helper.pid").read_text()), helper)
+
+    def test_mixed_shares_stop_independently_and_preserve_port_history(self):
+        self.assert_started(self.invoke("3000", "legacy"))
+        port = self.success("expose-port", "3001", "--key", "port")
+        history = (self.runtime / "tunnel-history").read_bytes()
+        files = [self.success("expose-files", str(self.content), "--update-mode", update,
+                              "--key", update) for update in ("manual", "live", "snapshot")]
+        self.assertEqual(len(self.success("list-shares")), 5)
+        self.success("stop-share", files[0]["id"])
+        self.assertFalse(self.publication(files[0]).exists())
+        self.assertEqual(len(self.success("list-shares")), 4)
+        self.assertTrue(self.publication(files[1]).exists())
+        self.assertEqual((self.runtime / "tunnel-history").read_bytes(), history)
+        self.assertTrue(any(share["id"] == port["id"] for share in self.success("list-shares")))
+        self.assertEqual(self.invoke("stop").returncode, 0)
+        self.assertFalse(any(running(pid) for pid in self.helpers))
+        self.assertFalse(list((self.runtime / "publications").iterdir()))
+        self.assertEqual((self.runtime / "tunnel-history").read_bytes(), history)
+        self.assertEqual(self.page.read_bytes(), b"<h1>initial</h1>")
+
+    def test_republication_and_cross_kind_replacements_clean_only_previous_share(self):
+        survivor = self.success("expose-port", "3000", "--key", "survivor")
+        old = self.success("expose-files", str(self.page), "--update-mode", "snapshot", "--key", "replace")
+        self.page.write_bytes(b"new snapshot")
+        new = self.success("expose-files", str(self.page), "--update-mode", "snapshot", "--key", "replace")
+        self.assertNotEqual(old["source_revision"], new["source_revision"])
+        self.assertFalse(self.publication(old).exists())
+        port = self.success("expose-port", "3001", "--key", "replace")
+        self.assertFalse(self.publication(new).exists())
+        files = self.success("expose-files", str(self.content), "--key", "replace")
+        self.assertEqual(self.success("list-shares"), [survivor, files])
+        self.failure("stop-share", port["id"])
+        self.success("stop-share", files["id"])
+        self.assertEqual(self.success("list-shares"), [survivor])
+
+    def test_foreground_port_cleanup_preserves_replacing_file_share(self):
+        foreground = self.foreground("3000", "foreground")
+        share = self.success("expose-files", str(self.content), "--key", "foreground")
+        output, error = foreground.communicate(timeout=10)
+        self.assertEqual(foreground.returncode, 1, output + error)
+        snapshot = self.saved_state()
+        self.assertEqual(self.success("list-shares"), [share])
+        self.assert_preserved(snapshot, [*self.helpers, int(self.registry()[0][4])])
+        self.assertTrue(self.publication(share).exists())
+
+    def test_failed_preparation_helper_and_connector_start_preserve_existing_share(self):
+        old = self.success("expose-files", str(self.content), "--key", "keep")
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)] + self.helpers
+        link = self.content / "unsafe-link"
+        link.symlink_to(self.page)
+        self.failure("expose-files", str(self.content), "--update-mode", "snapshot", "--key", "keep")
+        link.unlink()
+        self.assert_preserved(snapshot, pids)
+        # No alternate helper implementation: inject startup failure into this isolated copy.
+        script = self.project / "scripts/publication.py"
+        original = script.read_text()
+        script.write_text(original.replace('if __name__ == "__main__":',
+                                          'if __name__ == "__main__":\n    import sys\n'
+                                          '    if "serve-live" in sys.argv: sys.exit(99)'))
+        self.assertIn("helper failed to start", self.failure("expose-files", str(self.content), "--key", "keep")["message"])
+        script.write_text(original)
+        self.assert_preserved(snapshot, pids)
+        for daemon in ("CADDY", "CLOUDFLARED"):
+            self.env[f"FAIL_{daemon}"] = "1"
+            self.failure("expose-files", str(self.content), "--key", "keep")
+            self.env.pop(f"FAIL_{daemon}")
+            self.assert_preserved(snapshot, pids)
+        self.assertEqual([path.name for path in (self.runtime / "publications").iterdir()], [old["id"]])
+        self.assertEqual(self.success("list-shares"), [old])
+
+    def test_helper_exit_reports_degraded_and_stale_caddy_pruning_cleans_owned_state(self):
+        share = self.success("expose-files", str(self.content), "--update-mode", "manual")
+        directory = self.publication(share)
+        os.kill(int((directory / "helper.pid").read_text()), signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while running(self.helpers[-1]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.success("list-shares"), [share | {"state": "degraded"}])
+        self.assertEqual((directory / "public" / self.page.name).read_bytes(), self.page.read_bytes())
+        self.success("stop-share", share["id"])
+        share = self.success("expose-files", str(self.content), "--update-mode", "manual")
+        helper = self.helpers[-1]
+        os.kill(int(self.registry()[0][4]), signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while running(int(self.registry()[0][4])) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.success("expose-port", "3000")
+        self.assertFalse(self.publication(share).exists())
+        self.assertFalse(running(helper))
+
+    def test_cleanup_preserves_unrelated_helper_pid(self):
+        share = self.success("expose-files", str(self.content), "--update-mode", "manual")
+        unrelated = subprocess.Popen(["sleep", "60"])
+        self.launchers.append(unrelated)
+        (self.publication(share) / "helper.pid").write_text(str(unrelated.pid))
+        self.success("stop-share", share["id"])
+        self.assertTrue(running(unrelated.pid))
+        self.assertFalse(self.publication(share).exists())
+
+    def test_interrupted_file_start_rolls_back_owned_helper_and_preserves_survivor(self):
+        survivor = self.success("expose-port", "3000", "--key", "keep")
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)]
+        process = subprocess.Popen(
+            ["bash", str(self.project / "scripts/tunnel.sh"), "expose-files", str(self.content), "--key", "keep"],
+            env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.launchers.append(process)
+        deadline = time.monotonic() + 10
+        helpers = []
+        while time.monotonic() < deadline:
+            helpers = list(self.runtime.glob("publications/*/helper.pid"))
+            if helpers:
+                break
+            self.assertIsNone(process.poll())
+            time.sleep(0.01)
+        self.assertTrue(helpers)
+        helper = int(helpers[0].read_text())
+        self.helpers.append(helper)
+        process.terminate()
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 143, output + error)
+        self.assertIn("error", json.loads(output))
+        self.assertFalse(running(helper))
+        self.assertFalse(list((self.runtime / "publications").iterdir()))
+        self.assert_preserved(snapshot, pids)
+        self.assertEqual(self.success("list-shares"), [survivor])
+
+    def test_failed_file_stop_preserves_helper_and_successful_stop_prunes_stale_helpers(self):
+        shares = [self.success("expose-files", str(self.content), "--update-mode", "manual") for _ in range(2)]
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)] + self.helpers
+        self.env["FAIL_CLOUDFLARED"] = "1"
+        self.failure("stop-share", shares[0]["id"])
+        self.env.pop("FAIL_CLOUDFLARED")
+        self.assert_preserved(snapshot, pids)
+        self.assertEqual(self.success("list-shares"), shares)
+        stale_caddy = int(self.registry()[1][4])
+        os.kill(stale_caddy, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while running(stale_caddy) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.success("stop-share", shares[0]["id"])
+        self.assertFalse(any(running(pid) for pid in self.helpers))
+        self.assertFalse(list((self.runtime / "publications").iterdir()))

@@ -1,6 +1,6 @@
 # cloudflared-alias
 
-Cloudflare Tunnel with a local Caddy gate: share a backend via a keyed URL (path or subdomain) without changing the app.
+Cloudflare Tunnel with a local Caddy gate: share a backend or selected static files via a keyed URL (path or subdomain).
 
 ## Development and Agent Runner
 
@@ -26,10 +26,10 @@ cloudflared **2026.9.3**. `deploy/toolchain.json` records exact public artifact
 URLs, sizes and SHA-256 values. `.python-version` and `pyproject.toml` declare
 the runtime and direct dependencies; `requirements.lock` pins the complete
 Python wheel closure, including the test-only `quickjs-ng` browser engine.
-The official MCP SDK is pinned to **2.3.0**. These are installation prerequisites;
-the MCP and file-publication interfaces are not yet available.
+The official MCP SDK is pinned to **2.3.0**. The launcher supports structured port
+and file shares; the agent-facing MCP interface is not yet available.
 
-The internal preparation layer in `scripts/publication.py` copies one selected
+The preparation layer in `scripts/publication.py` copies one selected
 file or recursive directory without discovering adjacent assets. It rejects
 source symlinks, the launcher root and its ancestors, and internal metadata
 selections; directory copies omit VCS, launcher and environment metadata.
@@ -39,13 +39,13 @@ copies stay outside the served root. Failed preparation retains the accepted
 copy. SHA-256 revisions describe copied source bytes (a sorted path/digest
 manifest for directories), with a separate preparation-version-aware revision.
 Sources remain unchanged. Snapshot Caddy routes serve only the accepted copy;
-explicit preparation publishes new bytes. Internal file templates support path,
+explicit republication publishes new bytes. File templates support path,
 subdomain and no-key routes, with loopback-only listeners and no automatic TLS
 or admin endpoint. Directory indexes are `index.html` and `index.htm`; other
 static files retain their ordinary MIME types, without directory browsing.
 
-The internal manual helper starts with
-`python3 scripts/publication.py serve-manual CONFIG.json`. Its private JSON
+The launcher starts the manual helper with
+`python3 scripts/publication.py serve-manual --config CONFIG.json`. Its private JSON
 configuration contains `source`, `share_id`, `project_root` and a loopback `port`.
 The template's `__PUBLIC_ROOT__` is the managed `public/` path. Snapshot rendering
 leaves `__CACHE_POLICY__`, `__PREPARATION_HANDLER__` and `__EVENT_HANDLER__` empty;
@@ -70,7 +70,7 @@ remove their served copies; unsafe reads and failed preparation preserve the
 last accepted bytes. Traversal, private metadata and the reserved `__alias`
 control namespace cannot be served. The helper never sends static file bodies.
 
-The internal live helper uses `serve-live` with the same private configuration,
+The live helper uses `serve-live` with the same private configuration,
 plus `event_url`: the browser's same-origin event path, including the key prefix
 in path mode (for example, `/preview/__alias/events`). It defaults to
 `/__alias/events` for subdomain and no-key routes.
@@ -122,8 +122,8 @@ script (including restrictive Content Security Policy) leave native publication
 updates running. Ordinary refresh obtains the latest accepted content, including
 non-HTML formats. Custom edge-cache rules can override `no-store` and must be
 configured to preserve this behavior.
-Public file-share commands remain deferred until all update modes and launcher
-lifecycle integration are available.
+Both helpers run independently of the invoking launcher process. File changes
+do not restart Caddy or the shared cloudflared connector.
 
 Preparation requires Linux x86_64, bootstrap Python 3.11 or newer (the inspected
 host's 3.12.3 is sufficient), `cc`/GCC, `make`, `ar`, `tar`, `xz`, and OpenSSL,
@@ -205,6 +205,7 @@ finalization stages relevant changes and drafts a message without committing.
 | `--list`, `-l` | Show last 10 tunnels and pick one interactively (run without port). |
 | `stop` | Stop all Caddy instances and cloudflared. |
 | `expose-port PORT [--url-mode MODE] [--key KEY]` | Expose a port, detach and return one JSON share result. |
+| `expose-files PATH [--url-mode MODE] [--update-mode MODE] [--key KEY]` | Expose one file or directory, detach and return a JSON result; defaults to live updates. |
 | `list-shares` | Return a JSON array of active launcher-owned shares without prompts. |
 | `stop-share ID` | Stop only the identified share and return its result with `state: "stopped"`. |
 | `-p`, `--path` | Path mode (default): key in URL path. |
@@ -218,6 +219,8 @@ Examples: `./scripts/tunnel.sh -h` (help), `./scripts/tunnel.sh -l` (pick from h
 ```bash
 ./scripts/tunnel.sh expose-port 3000 --key release-preview
 ./scripts/tunnel.sh expose-port 3001 --url-mode subdomain --key api-preview
+./scripts/tunnel.sh expose-files ./site --key release-preview
+./scripts/tunnel.sh expose-files ./report.pdf --update-mode snapshot --key report
 ./scripts/tunnel.sh list-shares
 ./scripts/tunnel.sh stop-share 9090.Abc123  # Use the returned id
 ```
@@ -251,7 +254,7 @@ sensitive details. A key provides obscurity, not authentication.
 
 Listing includes legacy instances, derives each URL from its persisted routing
 data and does not migrate registry rows or consult interactive history. Caddy
-instances with a missing owned connector have `state: "degraded"`; stale or
+instances with a missing owned connector or file helper have `state: "degraded"`; stale or
 unowned Caddy entries are omitted. Listing and individual stopping need no
 source Cloudflare configuration or credentials. The original positional CLI,
 four-character legacy keys, foreground behavior, interactive history and
@@ -261,6 +264,45 @@ Share commands prefer the prepared `.venv/bin/python3`, falling back to
 `python3` on PATH. Set `ALIAS_PYTHON` to select another prepared interpreter;
 this option accepts an executable path, including spaces, rather than a shell
 command. The legacy positional interface does not require this Python helper.
+
+### Static file shares
+
+Supply exactly one regular file or directory. A file exposes only its own bytes,
+with its filename encoded in the returned URL; a directory exposes its recursive
+static assets at a base URL. Select the directory when an HTML page needs nearby
+CSS, JavaScript or images. The launcher does not discover dependencies, execute
+applications or convert formats. Symlinks, the launcher root and internal metadata
+are rejected; directory copies omit VCS and launcher metadata. Originals remain
+unchanged. The prepared interpreter and pinned dependencies are required for
+manual and live helpers.
+
+| Update mode | Behavior |
+| --- | --- |
+| `live` (default) | Native file events publish new copies; served HTML subscribes over SSE and reloads on a content revision. Other formats get new bytes on refresh. |
+| `manual` | Each request prepares current source bytes before Caddy serves them; no watcher or injected script. Refresh an open page to see changes. |
+| `snapshot` | Copied bytes stay frozen, even on refresh. Expose the source again with the same key to replace the snapshot. |
+
+URL mode is independent of update mode: all three update modes support path,
+subdomain and explicit no-key routing. Structured results include a canonical
+`source` with `type: "file"` or `"directory"`, `update_mode`, and available
+`source_revision` and `revision` hashes. Listing reports current accepted revisions
+without reopening missing sources. File shares are excluded from interactive port
+history. Reusing a key replaces its share, including across file and port shares;
+selecting the same source with different keys creates independent shares.
+
+Manual/live responses use `Cache-Control: no-store`. Subscription failures leave
+live publications updating and refresh serves current accepted bytes. Server-side
+preparation failures retain the last successful copy. If a helper exits, listing
+reports degraded state while Caddy keeps serving accepted bytes; stop and expose
+the share again to recover the helper.
+
+The launcher prepares publications and waits for helper readiness inside its
+existing startup transaction before installing the route. Failed or interrupted
+startup removes only the candidate's owned helper and managed publication state.
+Replacement, per-share stopping, stop-all and stale-Caddy pruning stop verified
+helper processes and remove that share's publications, without deleting source
+paths or affecting other shares. Shares survive the caller exiting; only routing
+changes refresh the shared connector.
 
 ## Quickstart
 
@@ -382,14 +424,18 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `deploy/caddy/Caddyfile.template`: Caddy (path with key).
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).
 - `deploy/caddy/Caddyfile.path-nokey.template`: Caddy (path, no key).
-- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Internal static routes and live event proxy.
+- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Static routes, manual preparation and live event proxy.
 - `deploy/cloudflared/config.template.yml`: Cloudflared template rendered at runtime.
 - `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
-  Caddy port, Caddy PID, instance directory and hostname).
+  Caddy port, Caddy PID, instance directory and hostname); file shares use `0`
+  in the backend field and do not conflict by source or backend port.
 - `.runtime/instances/<caddy-port>.<suffix>/`: Per-instance Caddy config, PID, log
   and private Caddy data/config directories. Each run gets a unique directory;
   structured exposures also persist their initial descriptor in `share.json`.
   The registry and verified process ownership determine current active state.
+- `.runtime/publications/<id>/`: Managed file generations and `public/` link;
+  private `helper.json`, log, helper PID/port and `ready.json` stay outside the
+  served root. Snapshot shares have no persistent helper.
 - `.runtime/launcher.lock`: Serializes start, stop and shared-state updates.
 - `.runtime/cloudflared/config.yml`: Rendered cloudflared config (multi-ingress to all instance ports).
 - `.runtime/current-share-url.txt`: Current generated share URL.
