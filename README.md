@@ -28,6 +28,18 @@ Python wheel closure, including the test-only `quickjs-ng` browser engine.
 The official MCP SDK is pinned to **2.3.0**. These are installation prerequisites;
 the MCP and file-publication interfaces are not yet available.
 
+The internal preparation layer in `scripts/publication.py` copies one selected
+file or recursive directory without discovering adjacent assets. It rejects
+source symlinks, the launcher root and its ancestors, and internal metadata
+selections; directory copies omit VCS, launcher and environment metadata.
+Each share has private state in `.runtime/publications/<id>/`. Its managed
+`public/` link selects a complete byte-only generation; metadata and unfinished
+copies stay outside the served root. Failed preparation retains the accepted
+copy. SHA-256 revisions describe copied source bytes (a sorted path/digest
+manifest for directories), with a separate preparation-version-aware revision.
+Sources remain unchanged, and accepted copies stay frozen until preparation
+is explicitly requested again. This layer does not start services.
+
 Preparation requires Linux x86_64, bootstrap Python 3.11 or newer (the inspected
 host's 3.12.3 is sufficient), `cc`/GCC, `make`, `ar`, `tar`, `xz`, and OpenSSL,
 zlib, libffi and bzip2 development headers. No PGO/LTO or optional readline,
