@@ -12,9 +12,10 @@
         route {
             @traversal expression `{http.request.orig_uri}.matches('(?i)^[^?]*(/|%2f)([.]|%2e){1,2}(/|%2f|[?]|$)')`
             respond @traversal "Invalid publication path" 400
+            __CACHE_POLICY__
+            __EVENT_HANDLER__
             @control path /__alias /__alias/*
             respond @control 404
-            __CACHE_POLICY__
             __PREPARATION_HANDLER__
             root * "__PUBLIC_ROOT__"
             file_server {
@@ -31,6 +32,8 @@
         route {
             rewrite * {http.request.orig_uri}
             __CACHE_POLICY__
+            @fallback_control path /__alias /__alias/*
+            respond @fallback_control 503
             @fallback_method not method GET HEAD
             respond @fallback_method 405
             root * "__PUBLIC_ROOT__"

@@ -223,6 +223,26 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.files(other), {"index.html": b"<h1>original</h1>"})
         self.assert_private(other)
 
+    def test_revision_inspection_recovers_from_concurrent_generation_cleanup(self):
+        share = self.publication(self.file)
+        previous = share.prepare()
+        metadata = share._generation() / "metadata.json"
+        self.file.write_bytes(b"newly activated")
+        read_text = Path.read_text
+        activated = None
+
+        def activate_before_read(path, *args, **kwargs):
+            nonlocal activated
+            if path == metadata and activated is None:
+                activated = share.prepare()
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", new=activate_before_read):
+            current = share.current()
+        self.assertEqual(current, activated)
+        self.assertNotEqual(current, previous)
+        self.assert_private(share)
+
     def test_interruption_after_activation_preserves_the_served_generation(self):
         real_replace = os.replace
 

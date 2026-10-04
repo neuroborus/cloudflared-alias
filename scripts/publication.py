@@ -1,6 +1,7 @@
 """Selection-bounded static copies; routing and lifecycle stay with the launcher."""
 
-from contextlib import contextmanager, ExitStack
+import asyncio
+from contextlib import asynccontextmanager, contextmanager, ExitStack
 from dataclasses import dataclass
 import hashlib
 import json
@@ -194,13 +195,20 @@ class Publication:
         return self.state_dir / Path(target).parent
 
     def current(self) -> PreparedPublication | None:
-        generation = self._generation()
-        if generation is None:
-            return None
-        result = json.loads((generation / "metadata.json").read_text(encoding="utf-8"))
-        if result["source_revision"] is None:
-            return None  # A manual standalone-file request accepted its deletion.
-        return PreparedPublication(result["source_revision"], result["revision"])
+        for _ in range(3):
+            generation = self._generation()
+            if generation is None:
+                return None
+            try:
+                result = json.loads((generation / "metadata.json").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                if generation == self._generation():
+                    raise
+                continue  # Live activation cleaned up the previous generation.
+            if result["source_revision"] is None:
+                return None  # A manual standalone-file request accepted its deletion.
+            return PreparedPublication(result["source_revision"], result["revision"])
+        raise PublicationError("Publication changed while reading its revision")
 
     def prepare(self, *, attempts: int = 3) -> PreparedPublication:
         if not 1 <= attempts <= 3:
@@ -403,12 +411,186 @@ def manual_app(publication: Publication):
     return Starlette(routes=[Route("/__alias/prepare", prepare, methods=["GET"])])
 
 
+class LivePublication:
+    """Native events prepare bytes independently of bounded SSE subscribers."""
+
+    def __init__(self, publication: Publication, *, debounce: float = 0.1):
+        self.publication = publication
+        self.debounce = debounce
+        self.current: PreparedPublication | None = None
+        self.subscribers: set[asyncio.Queue] = set()
+        self._changed = asyncio.Event()
+        self._publication_lock = asyncio.Lock()
+        self._stopping = False
+        self._observer = None
+        self._directory_watch = None
+        selection = publication.selection
+        self._watch_root = selection.path if selection.kind == "directory" else selection.path.parent
+        self._rewatch = False
+        self._worker = None
+
+    async def start(self) -> None:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers.inotify import InotifyObserver
+
+        loop = asyncio.get_running_loop()
+        selection = self.publication.selection
+        owner = self
+
+        def changed(root_changed):
+            owner._rewatch |= root_changed
+            owner._changed.set()
+
+        class Changes(FileSystemEventHandler):
+            def on_any_event(self, event):
+                # Reads produce open/close-no-write events. Ignore them so
+                # preparation cannot watch itself. Directory attribute changes
+                # can recover a previously unreadable source.
+                if event.event_type not in {"created", "deleted", "moved", "modified", "closed"}:
+                    return
+                paths = (event.src_path, getattr(event, "dest_path", ""))
+                root_changed = (event.event_type in {"created", "deleted", "moved"}
+                                and str(owner._watch_root) in paths)
+                if not owner._stopping and (root_changed or any(
+                        owner._selected(path) for path in paths if path)):
+                    loop.call_soon_threadsafe(changed, root_changed)
+
+        self._observer = InotifyObserver()
+        self._handler = Changes()
+        # Watch the containing directory first, so replacement of either a
+        # selected directory or a standalone file's parent can rearm its watch.
+        self._observer.schedule(self._handler, str(self._watch_root.parent), recursive=False)
+        self._directory_watch = self._observer.schedule(
+            self._handler, str(self._watch_root), recursive=selection.kind == "directory")
+        try:
+            # Watch first: events during initial copying remain queued, closing
+            # the gap between the source read and the first accepted revision.
+            self._observer.start()
+            self.current = await asyncio.to_thread(self.publication.prepare)
+            self._worker = asyncio.create_task(self._updates())
+        except BaseException:
+            await self.stop()
+            raise
+
+    def _selected(self, path: str) -> bool:
+        selection = self.publication.selection
+        candidate = Path(path)
+        if selection.kind == "file":
+            return candidate == selection.path
+        try:
+            relative = candidate.relative_to(selection.path)
+        except ValueError:
+            return False
+        return not any(_excluded(part) for part in relative.parts)
+
+    async def _updates(self) -> None:
+        while not self._stopping:
+            await self._changed.wait()
+            while not self._stopping:
+                self._changed.clear()
+                try:
+                    await asyncio.wait_for(self._changed.wait(), timeout=self.debounce)
+                except TimeoutError:
+                    break
+            if self._stopping:
+                return
+            try:
+                if self._rewatch:
+                    self._rewatch = False
+                    try:
+                        await asyncio.to_thread(self._restore_watch)
+                    except Exception:
+                        self._rewatch = True
+                        raise
+                async with self._publication_lock:
+                    prepared = await asyncio.to_thread(self.publication.prepare)
+                    if prepared == self.current:
+                        continue
+                    # Activation and announcement complete before a new
+                    # subscription can capture its initial accepted revision.
+                    self.current = prepared
+                    for queue in self.subscribers:
+                        if queue.full():
+                            queue.get_nowait()
+                        queue.put_nowait(prepared)
+            except Exception as error:
+                logging.getLogger(__name__).warning("Keeping accepted publication: %s", error)
+
+    def _restore_watch(self) -> None:
+        # Rearm on a root event, never a timer. Validate before adding watches;
+        # the preparation path independently rechecks containment when opening.
+        selection = self.publication.selection
+        if selection.kind == "file":
+            # Validate every ancestor without links. The selected file may not
+            # exist yet in the replacement parent; install its watch anyway.
+            with _parent(selection.path):
+                pass
+        else:
+            selected = select_source(selection.path, project_root=self.publication.project_root)
+            if selected.kind != "directory":
+                raise PublicationError("Selected source type changed")
+        if self._directory_watch is not None:
+            self._observer.unschedule(self._directory_watch)
+            self._directory_watch = None
+        self._directory_watch = self._observer.schedule(
+            self._handler, str(self._watch_root), recursive=selection.kind == "directory")
+
+    async def events(self):
+        queue = asyncio.Queue(maxsize=1)
+        try:
+            # Also wait for activation in flight, so initial state cannot lag
+            # bytes already served by Caddy while generation cleanup finishes.
+            async with self._publication_lock:
+                self.subscribers.add(queue)
+                queue.put_nowait(self.current)
+            while True:
+                prepared = await queue.get()
+                yield {"event": "revision", "id": prepared.revision,
+                       "data": json.dumps({"revision": prepared.revision,
+                                           "source_revision": prepared.source_revision})}
+        finally:
+            self.subscribers.discard(queue)
+
+    async def stop(self) -> None:
+        self._stopping = True
+        self._changed.set()
+        if self._worker is not None:
+            # Finish preparation/rearming before stopping native watch threads.
+            await self._worker
+        if self._observer is not None:
+            self._observer.stop()
+            if self._observer.ident is not None:
+                await asyncio.to_thread(self._observer.join, 5)
+
+
+def live_app(live: LivePublication, *, heartbeat: float = 15):
+    """Loopback SSE only; Caddy serves all accepted static content."""
+    from sse_starlette.sse import EventSourceResponse
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await live.start()
+        try:
+            yield
+        finally:
+            await live.stop()
+
+    async def events(request):
+        return EventSourceResponse(live.events(), ping=heartbeat, send_timeout=5,
+                                   headers={"Cache-Control": "no-store"})
+
+    return Starlette(lifespan=lifespan,
+                     routes=[Route("/__alias/events", events, methods=["GET"])])
+
+
 def main() -> None:
     import argparse
     import uvicorn
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["serve-manual"])
+    parser.add_argument("command", choices=["serve-manual", "serve-live"])
     parser.add_argument("config", type=Path)
     arguments = parser.parse_args()
     config = json.loads(arguments.config.read_text(encoding="utf-8"))
@@ -417,9 +599,13 @@ def main() -> None:
         parser.error("Helper port must be between 1 and 65535")
     publication = Publication(config["source"], config["share_id"],
                               project_root=Path(config["project_root"]))
-    if publication._generation() is None:
-        publication.prepare()
-    uvicorn.run(manual_app(publication), host="127.0.0.1", port=port, access_log=False)
+    if arguments.command == "serve-live":
+        app = live_app(LivePublication(publication))
+    else:
+        if publication._generation() is None:
+            publication.prepare()
+        app = manual_app(publication)
+    uvicorn.run(app, host="127.0.0.1", port=port, access_log=False)
 
 
 if __name__ == "__main__":

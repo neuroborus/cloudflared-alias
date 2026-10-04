@@ -48,9 +48,9 @@ The internal manual helper starts with
 `python3 scripts/publication.py serve-manual CONFIG.json`. Its private JSON
 configuration contains `source`, `share_id`, `project_root` and a loopback `port`.
 The template's `__PUBLIC_ROOT__` is the managed `public/` path. Snapshot rendering
-leaves `__CACHE_POLICY__` and `__PREPARATION_HANDLER__` empty; manual rendering
-sets the former to `header Cache-Control "no-store"` and the latter to a Caddy
-preparation block:
+leaves `__CACHE_POLICY__`, `__PREPARATION_HANDLER__` and `__EVENT_HANDLER__` empty;
+manual rendering leaves `__EVENT_HANDLER__` empty, sets `__CACHE_POLICY__` to
+`header >Cache-Control "no-store"` and uses this `__PREPARATION_HANDLER__` block:
 
 ```caddyfile
 forward_auth 127.0.0.1:PORT {
@@ -69,6 +69,40 @@ Caddy serves bytes. Manual mode has no watcher or reload injection. Deletions
 remove their served copies; unsafe reads and failed preparation preserve the
 last accepted bytes. Traversal, private metadata and the reserved `__alias`
 control namespace cannot be served. The helper never sends static file bodies.
+
+The internal live helper uses `serve-live` with the same private configuration.
+It installs native Linux `InotifyObserver` watches before preparing the initial
+copy, then debounces source events and activates complete generations before
+announcing their effective revisions. Directory watches are recursive; filtered
+parent watches detect standalone atomic saves. Containing-directory watches
+also recover replacement of the selected directory or a standalone file's parent.
+Read notifications and idle time do not trigger preparation;
+excluded metadata stays outside the publication.
+Identical content does not announce a revision. Failed preparation preserves
+the accepted copy and a subsequent native event can recover it. No filesystem
+polling or subscriber is needed for updates.
+
+Live rendering leaves `__PREPARATION_HANDLER__` empty, sets `__CACHE_POLICY__` to
+`header >Cache-Control "no-store"` for HTML and assets, and uses this event block
+for `__EVENT_HANDLER__`:
+
+```caddyfile
+@events path /__alias/events
+reverse_proxy @events 127.0.0.1:PORT {
+    flush_interval -1
+}
+```
+
+The event route stays inside the selected key route; path mode strips the key
+prefix before proxying. SSE responses use `Cache-Control: no-store` and stream
+without compression or buffering. The deferred header policy replaces upstream
+cache headers rather than appending a duplicate value. Each connection/reconnect
+immediately receives the current `revision` event, whose JSON data contains `revision` and
+`source_revision`; its event ID is the effective revision. Slow subscribers keep
+only the latest pending revision. Comment heartbeats maintain idle connections
+without inspecting sources. Static requests serve current accepted bytes even
+without a subscription, and event-service failure leaves accepted content
+available with no-store caching. HTML reload injection is added separately.
 Public file-share commands remain deferred until all update modes and launcher
 lifecycle integration are available.
 
@@ -327,7 +361,7 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `deploy/caddy/Caddyfile.template`: Caddy (path with key).
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).
 - `deploy/caddy/Caddyfile.path-nokey.template`: Caddy (path, no key).
-- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Internal snapshot/manual static routes.
+- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Internal static routes and live event proxy.
 - `deploy/cloudflared/config.template.yml`: Cloudflared template rendered at runtime.
 - `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
   Caddy port, Caddy PID, instance directory and hostname).

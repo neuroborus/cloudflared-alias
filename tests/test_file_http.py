@@ -40,7 +40,7 @@ def stop_process(process):
         process.wait(timeout=5)
 
 
-class FileHTTPTests(unittest.TestCase):
+class FileHTTPFixture:
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="alias-file-http-")
         self.addCleanup(self.temporary.cleanup)
@@ -76,14 +76,16 @@ class FileHTTPTests(unittest.TestCase):
         self.fail(f"Local service did not start: {diagnostic}")
 
     @contextmanager
-    def serve(self, source=None, update="snapshot", mode="path", *, helper_available=True):
+    def serve(self, source=None, update="snapshot", mode="path", *,
+              helper_available=True, with_events=False, events_blocked=False):
         self.sequence += 1
         share = Publication(source or self.source, f"http-{self.sequence}",
                             project_root=self.project)
         share.prepare()
         with ExitStack() as cleanup:
             preparation = ""
-            if update == "manual":
+            event_handler = ""
+            if update in ("manual", "live"):
                 helper_port = free_port()
                 config = share.state_dir / "helper.json"
                 config.write_text(json.dumps({"source": str(share.selection.path),
@@ -93,11 +95,19 @@ class FileHTTPTests(unittest.TestCase):
                 log = share.state_dir / "helper.log"
                 output = cleanup.enter_context(log.open("wb"))
                 helper = subprocess.Popen([sys.executable, str(self.project / "scripts/publication.py"),
-                                           "serve-manual", str(config)],
+                                           f"serve-{update}", str(config)],
                                           stdin=subprocess.DEVNULL, stdout=output, stderr=output)
                 cleanup.callback(stop_process, helper)
                 self.wait_listening(helper, helper_port, log)
-                preparation = f"""forward_auth 127.0.0.1:{helper_port} {{
+                if update == "live":
+                    event_handler = f"""@events path /__alias/events
+                    reverse_proxy @events 127.0.0.1:{helper_port} {{
+                        flush_interval -1
+                    }}"""
+                    if events_blocked:
+                        event_handler = '@events path /__alias/events\nrespond @events "Blocked" 403'
+                else:
+                    preparation = f"""forward_auth 127.0.0.1:{helper_port} {{
                     uri /__alias/prepare
                     @unavailable status 5xx
                     handle_response @unavailable {{
@@ -110,8 +120,9 @@ class FileHTTPTests(unittest.TestCase):
             replacements = {"__CADDY_PORT__": str(port), "__PATH_ID__": "test-key",
                             "__SUBDOMAIN_HOST__": "test-key.example.test",
                             "__PUBLIC_ROOT__": str(share.public_root),
-                            "__CACHE_POLICY__": 'header Cache-Control "no-store"' if update == "manual" else "",
-                            "__PREPARATION_HANDLER__": preparation}
+                            "__CACHE_POLICY__": 'header >Cache-Control "no-store"' if update != "snapshot" else "",
+                            "__PREPARATION_HANDLER__": preparation,
+                            "__EVENT_HANDLER__": event_handler}
             for token, value in replacements.items():
                 template = template.replace(token, value)
             config = share.state_dir / "Caddyfile"
@@ -124,7 +135,7 @@ class FileHTTPTests(unittest.TestCase):
                                      env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output)
             cleanup.callback(stop_process, caddy)
             self.wait_listening(caddy, port, log)
-            if update == "manual" and not helper_available:
+            if update in ("manual", "live") and not helper_available:
                 stop_process(helper)
 
             def request(path="/", *, host=None, keyed=True, method="GET"):
@@ -139,7 +150,26 @@ class FileHTTPTests(unittest.TestCase):
                 finally:
                     connection.close()
 
-            yield share, request
+            @contextmanager
+            def events(*, last_revision=None, timeout=5):
+                path = "/__alias/events"
+                if mode == "path":
+                    path = "/test-key" + path
+                headers = {"Host": "test-key.example.test" if mode == "subdomain" else "example.test"}
+                if last_revision is not None:
+                    headers["Last-Event-ID"] = last_revision
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+                try:
+                    connection.request("GET", path, headers=headers)
+                    with connection.getresponse() as response:
+                        yield response
+                finally:
+                    connection.close()
+
+            yield (share, request, events) if with_events else (share, request)
+
+
+class FileHTTPTests(FileHTTPFixture, unittest.TestCase):
 
     def test_snapshot_freezes_bytes_and_explicit_republication_refreshes(self):
         for mode in ("path", "subdomain", "no-key"):
