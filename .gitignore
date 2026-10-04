@@ -16,3 +16,6 @@ __pycache__/
 # Isolated pinned runtimes, verified downloads and Python dependencies
 /.tools/
 /.venv/
+
+# Generated project-local Codex MCP registration; the template stays tracked
+/.codex/config.toml

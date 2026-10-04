@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cloudflared_alias": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "root=\"$PWD\"; while [ ! -f \"$root/scripts/mcp.sh\" ]; do [ \"$root\" != / ] || exit 1; root=$(dirname \"$root\"); done; exec bash \"$root/scripts/mcp.sh\""
+      ]
+    }
+  }
+}
