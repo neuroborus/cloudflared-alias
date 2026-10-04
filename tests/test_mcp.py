@@ -1,7 +1,6 @@
 """Official SDK stdio discovery and calls against isolated synthetic launchers."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -12,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
 
 from mcp import Client, StdioServerParameters
@@ -59,20 +57,22 @@ class MCPResultTests(unittest.TestCase):
                 self.assertEqual(bool(received.is_error), error)
 
 
-class MCPRegistrationTests(unittest.TestCase):
+class ToolchainSetupTests(unittest.TestCase):
     def setUp(self):
-        scratch = tempfile.TemporaryDirectory(prefix="alias-mcp-registration-")
+        scratch = tempfile.TemporaryDirectory(prefix="alias-toolchain-setup-")
         self.addCleanup(scratch.cleanup)
         self.project = Path(scratch.name) / "project with spaces"
+        self.other_project = Path(scratch.name) / "unrelated project with spaces"
+        self.other_project.mkdir()
+        self.user_home = Path(scratch.name) / "synthetic user home"
+        self.user_home.mkdir()
+        self.env = os.environ | {
+            "HOME": str(self.user_home), "CODEX_HOME": str(self.user_home / ".codex"),
+            "CLAUDE_CONFIG_DIR": str(self.user_home / ".claude"),
+        }
         scripts = self.project / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("prepare_mcp.py", "setup.sh"):
-            shutil.copyfile(ROOT / "scripts" / name, scripts / name)
-        shutil.copytree(ROOT / "deploy/mcp", self.project / "deploy/mcp")
-        self.config = self.project / ".codex/config.toml"
-        self.template = self.project / "deploy/mcp/codex.config.toml"
-        self.registration = tomllib.loads(self.template.read_text())["mcp_servers"]["cloudflared_alias"]
-        # Exercise setup's registration boundary without rebuilding a toolchain.
+        shutil.copyfile(ROOT / "scripts/setup.sh", scripts / "setup.sh")
         (scripts / "toolchain.py").write_text('''import json
 import os
 from pathlib import Path
@@ -81,126 +81,50 @@ import sys
 sys.exit(int(os.environ.get("TEST_SETUP_EXIT", "0")))
 ''')
 
-    def prepare(self):
-        return subprocess.run([sys.executable, "-I", str(self.project / "scripts/prepare_mcp.py")],
-                              text=True, capture_output=True, timeout=10)
-
     def setup(self, *arguments, code=0):
         return subprocess.run(["bash", str(self.project / "scripts/setup.sh"), *arguments],
-                              env=os.environ | {"TEST_SETUP_EXIT": str(code)},
+                              cwd=self.other_project,
+                              env=self.env | {"TEST_SETUP_EXIT": str(code)},
                               text=True, capture_output=True, timeout=10)
 
-    def write_config(self, text):
-        self.config.parent.mkdir(exist_ok=True)
-        self.config.write_text(text)
-
-    def test_fresh_materialization_and_repetition(self):
-        template = self.template.read_bytes()
-        for _ in range(2):
-            result = self.prepare()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.config.read_bytes(), template)
-            self.assertEqual(self.template.read_bytes(), template)
-            self.assertEqual(list(self.config.parent.iterdir()), [self.config])
-        self.assertFalse((self.project / ".runtime").exists())
-
-    def test_adds_missing_entry_preserving_operator_text_and_settings(self):
-        original = ('# Keep this comment and formatting.\nmodel = "operator-model"\n'
-                    '[profiles.review]\nmodel = "review-model"\n'
-                    '[mcp_servers.other]\ncommand = "operator-command"\nargs = ["--stdio"]')
-        self.write_config(original)
-        self.config.chmod(0o640)
-        result = self.prepare()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        content = self.config.read_text()
-        self.assertTrue(content.startswith(original + "\n"))
-        expected = tomllib.loads(original)
-        expected["mcp_servers"]["cloudflared_alias"] = self.registration
-        self.assertEqual(tomllib.loads(content), expected)
-        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
-        result = self.prepare()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.config.read_text(), content)
-
-    def test_accepts_matching_entry_with_operator_options_without_rewriting(self):
-        original = self.template.read_text() + 'env = { OPERATOR_OPTION = "keep" }\nenabled = false\n'
-        self.write_config(original)
-        result = self.prepare()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.config.read_text(), original)
-
-    def test_conflicts_and_invalid_toml_are_reported_without_overwriting(self):
-        for original in (
-            '[mcp_servers.cloudflared_alias]\ncommand = "other"\nargs = []\n',
-            self.template.read_text().replace('command = "bash"', 'command = "sh"'),
-            'mcp_servers = { cloudflared_alias = "operator-value" }\n',
-            'mcp_servers = []\n',
-            'mcp_servers = { other = { command = "operator-command" } }\n',
-            '[unfinished\n',
+    def test_setup_forwards_preparation_arguments_without_client_configuration(self):
+        for arguments in (
+            ("--offline", "--artifacts", "owned artifacts", "--tools", "scratch tools",
+             "--venv", "scratch venv"), ("--help",), ("-h",),
         ):
-            with self.subTest(original=original):
-                self.write_config(original)
-                result = self.prepare()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertTrue(result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(self.config.read_text(), original)
-
-    def test_concurrent_preparation_adds_one_entry(self):
-        self.write_config('# Operator setting\nmodel = "operator-model"\n')
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(lambda _: self.prepare(), range(4)))
-        for result in results:
-            self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.config.read_text().count('[mcp_servers.cloudflared_alias]'), 1)
-        self.assertEqual(tomllib.loads(self.config.read_text())["mcp_servers"],
-                         {"cloudflared_alias": self.registration})
-
-    def test_does_not_follow_config_or_directory_symlinks(self):
-        target = self.project / "operator-config"
-        target.mkdir()
-        operator = target / "config.toml"
-        operator.write_text('model = "keep"\n')
-        self.config.parent.symlink_to(target, target_is_directory=True)
-        result = self.prepare()
-        self.assertNotEqual(result.returncode, 0)
-        self.config.parent.unlink()
-        self.config.parent.mkdir()
-        self.config.symlink_to(operator)
-        result = self.prepare()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(operator.read_text(), 'model = "keep"\n')
-
-    def test_normal_setup_materializes_only_after_successful_preparation(self):
-        result = self.setup("--offline", "--artifacts", "owned artifacts")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.config.read_bytes(), self.template.read_bytes())
-        self.assertEqual(json.loads((self.project / "setup-arguments.json").read_text()),
-                         ["prepare", "--offline", "--artifacts", "owned artifacts"])
-        self.config.unlink()
-        result = self.setup(code=7)
-        self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertFalse(self.config.exists())
-
-    def test_scratch_setup_and_help_do_not_materialize_registration(self):
-        for arguments in (("--skip-mcp-registration", "--tools", "scratch tools"), ("--help",), ("-h",)):
             with self.subTest(arguments=arguments):
                 result = self.setup(*arguments)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse(self.config.parent.exists())
-                forwarded = json.loads((self.project / "setup-arguments.json").read_text())
-                self.assertNotIn("--skip-mcp-registration", forwarded)
+                self.assertEqual(json.loads((self.project / "setup-arguments.json").read_text()),
+                                 ["prepare", *arguments])
+                self.assertFalse((self.project / ".codex").exists())
+                self.assertFalse((self.project / ".mcp.json").exists())
+                self.assertEqual(list(self.user_home.iterdir()), [])
 
-    def test_normal_setup_reports_existing_registration_conflict(self):
-        original = '[mcp_servers.cloudflared_alias]\ncommand = "operator-command"\n'
-        self.write_config(original)
-        result = self.setup()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Conflicting", result.stderr)
-        self.assertEqual(self.config.read_text(), original)
+    def test_setup_preserves_operator_client_configuration_and_preparation_failure(self):
+        codex = b'# Preserve operator formatting.\nmodel = "operator-model"\n'
+        claude = b'{"mcpServers":{"other":{"command":"operator-command"}}}\n'
+        configurations = {
+            self.project / ".codex/config.toml": codex,
+            self.project / ".mcp.json": claude,
+            self.user_home / ".codex/config.toml": codex,
+            self.user_home / ".claude/.claude.json": claude,
+            self.user_home / ".claude.json": claude,
+        }
+        for path, content in configurations.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        for code in (0, 7):
+            with self.subTest(code=code):
+                result = self.setup(code=code)
+                self.assertEqual(result.returncode, code, result.stderr)
+                for path, content in configurations.items():
+                    self.assertEqual(path.read_bytes(), content, str(path))
 
 
 class MCPFixture(ShareFixture):
+    project_name = "alias installation with spaces"
+
     def setUp(self):
         self.helpers = set()
         super().setUp()
@@ -275,6 +199,11 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
 
 
 class MCPTests(MCPFixture):
+    def assert_source_guidance(self, text):
+        self.assertIn("Relative file paths resolve from the alias installation root", text)
+        self.assertIn(str(self.project), text)
+        self.assertIn("Use absolute paths for files in other projects.", text)
+
     def assert_guidance(self, text):
         for phrase in (
             "Always provide a key", "bare-domain", "path mode", "meaningful and useful",
@@ -288,6 +217,7 @@ class MCPTests(MCPFixture):
         async def body():
             async with self.client() as client:
                 self.assert_guidance(client.instructions)
+                self.assert_source_guidance(client.instructions)
                 tools = {tool.name: tool for tool in (await client.list_tools()).tools}
                 self.assertEqual(set(tools), {"expose_port", "expose_files", "list_shares", "stop_share"})
                 for name in ("expose_port", "expose_files"):
@@ -306,6 +236,8 @@ class MCPTests(MCPFixture):
                 port = tools["expose_port"].input_schema["properties"]["port"]
                 self.assertEqual((port["minimum"], port["maximum"]), (1, 65535))
                 files = tools["expose_files"].input_schema
+                self.assert_source_guidance(tools["expose_files"].description)
+                self.assert_source_guidance(files["properties"]["path"]["description"])
                 self.assertEqual(files["required"], ["path"])
                 self.assertEqual(files["properties"]["path"]["minLength"], 1)
                 self.assertIn("pattern", files["properties"]["path"])
@@ -483,30 +415,34 @@ class MCPTests(MCPFixture):
                     self.assertEqual(error["error"]["code"], "invalid_launcher_result")
         self.run_client(body)
 
-    def test_client_registrations_resolve_root_from_project_and_subdirectory(self):
-        result = subprocess.run([sys.executable, "-I", str(self.project / "scripts/prepare_mcp.py")],
-                                text=True, capture_output=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        codex = tomllib.loads((self.project / ".codex/config.toml").read_text())["mcp_servers"]["cloudflared_alias"]
-        shutil.copyfile(ROOT / ".mcp.json", self.project / ".mcp.json")
-        claude = json.loads((self.project / ".mcp.json").read_text())["mcpServers"]["cloudflared_alias"]
-        self.assertEqual(codex, claude)
-        for registration in (codex, claude):
-            self.assertEqual(registration["command"], "bash")
-            self.assertNotIn(str(ROOT), json.dumps(registration))
+    def test_user_registered_wrapper_starts_from_any_project_and_shares_foreign_files(self):
+        other_project = self.project.parent / "other project with spaces"
+        other_project.mkdir()
+        page = other_project / "foreign page.html"
+        original = b"<h1>other project</h1>"
+        page.write_bytes(original)
+        registration = {"command": "bash", "args": [str(self.project / "scripts/mcp.sh")]}
         self.assertEqual(os.readlink(ROOT / "CLAUDE.md"), "AGENTS.md")
         self.assertEqual(os.readlink(ROOT / ".claude/skills"), "../.agents/skills")
         async def body():
-            for registration in (codex, claude):
-                for cwd in (self.project, self.site):
-                    async with self.client(registration=registration, cwd=cwd) as client:
-                        self.assertEqual(await self.call(client, "list_shares"), {"shares": []})
-            # Project-local prepared Python works without a global client interpreter setting.
-            # Reuse the gate's complete pinned venv, including its dependency paths.
+            for cwd in (self.project, self.site, other_project):
+                async with self.client(registration=registration, cwd=cwd) as client:
+                    self.assertEqual(await self.call(client, "list_shares"), {"shares": []})
+                    self.assert_source_guidance(client.instructions)
+            # An installed venv works independently of the client's project.
             (self.project / ".venv").symlink_to(sys.prefix, target_is_directory=True)
             env = self.env.copy()
             env.pop("ALIAS_PYTHON")
-            async with self.client(registration=codex, env=env) as client:
+            async with self.client(registration=registration, cwd=other_project, env=env) as client:
+                share = await self.call(client, "expose_files", {
+                    "path": str(page), "update_mode": "snapshot", "key": "foreign-page",
+                })
+                self.assertEqual(share["source"], {"type": "file", "path": str(page)})
+                public = self.runtime / "publications" / share["id"] / "public"
+                self.assertEqual((public / page.name).read_bytes(), original)
+                self.assertFalse((other_project / ".runtime").exists())
+                await self.call(client, "stop_share", {"id": share["id"]})
+                self.assertEqual(page.read_bytes(), original)
                 self.assertEqual(await self.call(client, "list_shares"), {"shares": []})
         self.run_client(body)
 

@@ -22,7 +22,7 @@ if [[ -n "${AGENT_RUNNER_DEPENDENCIES:-}" ]]; then
   trap 'rm -rf -- "$CHECK_SCRATCH"' EXIT
   export TMPDIR="$CHECK_SCRATCH"
   bash scripts/setup.sh --offline --artifacts "$AGENT_RUNNER_DEPENDENCIES" \
-    --tools "$CHECK_SCRATCH/tools" --venv "$CHECK_SCRATCH/venv" --skip-mcp-registration
+    --tools "$CHECK_SCRATCH/tools" --venv "$CHECK_SCRATCH/venv"
   CHECK_PYTHON="$CHECK_SCRATCH/venv/bin/python3"
   CHECK_CADDY="$CHECK_SCRATCH/tools/caddy/usr/bin/caddy"
 else

@@ -37,10 +37,12 @@ def running(pid):
 
 
 class TunnelFixture(unittest.TestCase):
+    project_name = "project"
+
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="cloudflared-alias-test-")
         self.addCleanup(self.scratch.cleanup)
-        self.project = Path(self.scratch.name) / "project"
+        self.project = Path(self.scratch.name) / self.project_name
         self.project.mkdir()
         shutil.copytree(ROOT / "scripts", self.project / "scripts")
         shutil.copytree(ROOT / "deploy", self.project / "deploy")

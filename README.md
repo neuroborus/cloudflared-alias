@@ -28,8 +28,8 @@ cloudflared **2026.9.3**. `deploy/toolchain.json` records exact public artifact
 URLs, sizes and SHA-256 values. `.python-version` and `pyproject.toml` declare
 the runtime and direct dependencies; `requirements.lock` pins the complete
 Python wheel closure, including the test-only `quickjs-ng` browser engine.
-The official MCP SDK is pinned to **2.3.0**. Project-local Codex and Claude Code
-sessions can use its stdio adapter to control the launcher's structured shares.
+The official MCP SDK is pinned to **2.3.0**. Register its stdio adapter once for
+your user so Codex and Claude Code can control the launcher from any project.
 
 The preparation layer in `scripts/publication.py` copies one selected
 file or recursive directory without discovering adjacent assets. It rejects
@@ -267,36 +267,47 @@ Share commands prefer the prepared `.venv/bin/python3`, falling back to
 this option accepts an executable path, including spaces, rather than a shell
 command. The legacy positional interface does not require this Python helper.
 
-### Project-local MCP
+### MCP for all projects
 
-Run `bash scripts/setup.sh` to prepare the pinned runtime and project registration.
-Setup materializes the tracked `deploy/mcp/codex.config.toml` template as the
-ignored local `.codex/config.toml`. It adds a missing server entry while preserving
-existing settings and comments, and accepts a matching command/arguments without
-rewriting operator options. A conflicting entry or TOML structure is reported
-without overwriting it; reconcile it with the template and rerun setup. Symlinked
-Codex configuration is refused to keep preparation project-local. Claude Code's
-`.mcp.json` is tracked and already registers the same wrapper.
+Prepare the pinned runtime from this repository root:
 
-Codex loads `.codex/config.toml` only for trusted projects; Claude Code uses
-`.mcp.json` after project-server approval. Start the client in this project or a
-subdirectory.
-Both registrations find the project wrapper from the working directory without
-machine-specific paths or client variable expansion. The wrapper resolves its
-own root, selects `.venv/bin/python3` (or the `ALIAS_PYTHON` environment override)
-and adds the prepared local Caddy to PATH. It fails explicitly if Python is
-missing; global client configuration is not changed.
+```bash
+bash scripts/setup.sh
+```
 
-Runner's scratch preparation uses `--skip-mcp-registration` and leaves its source
-projection's client configuration untouched. After Runner is DONE, run normal
-setup in the operator checkout to generate the local Codex configuration there.
-If the runtime is already prepared, `python3 -I scripts/prepare_mcp.py` can repeat
-registration preparation independently.
+Register the server once for your user in each client you use, from the same
+repository root:
 
-The wrapper can also be registered manually as `bash /path/to/project/scripts/mcp.sh`
-in a separate client configuration. Its only transport is stdio; MCP control is
-never exposed through the public tunnel. Exposure reuses the existing named
-tunnel configuration and requires the same operator setup as the CLI.
+```bash
+codex mcp add cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
+claude mcp add --transport stdio --scope user cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
+```
+
+Codex stores the registration in its user configuration; Claude Code uses user
+scope. New client sessions discover the tools in any project or subdirectory.
+The clients launch the server automatically; no standalone service is required.
+To inspect the registrations, use `codex mcp get cloudflared_alias` or
+`claude mcp get cloudflared_alias`. Restart an existing client session after
+registration. If the alias installation moves, rerun registration from its new
+root; first remove Claude Code's old user registration with
+`claude mcp remove --scope user cloudflared_alias`.
+
+Runtime dependencies remain in the alias installation's `.tools/` and `.venv/`.
+Setup prepares only those dependencies, without changing client configuration.
+The absolute wrapper path makes startup independent of the client's working
+directory. The wrapper resolves its own root, selects `.venv/bin/python3`
+(or the `ALIAS_PYTHON` environment override) and adds the prepared local Caddy
+to PATH. It fails explicitly if Python is missing.
+
+When upgrading from the former project-only setup, remove only the alias's
+`[mcp_servers.cloudflared_alias]` entry from the local `.codex/config.toml` so
+it cannot override the user registration. Project `.mcp.json` registration is
+no longer part of this repository.
+
+The server's only transport is stdio; MCP control is never exposed through the
+public tunnel. Exposure reuses the existing named tunnel configuration and
+requires the same operator setup as the CLI. Tunnel configuration and share
+state belong to the alias installation, regardless of the client's project.
 
 | Tool | Arguments |
 | --- | --- |
@@ -313,8 +324,9 @@ Schema validation failures are SDK tool errors. Diagnostics go to stderr.
 Each result belongs to its request, including concurrent exposures; no tool
 reads shared last-URL files or interactive history.
 
-Relative file paths resolve from the project root. Select one file to expose
-only that file, or a directory for a page with nearby assets. Shares survive
+Use absolute file paths for content in other projects; relative paths resolve
+from the alias installation root. Select one file to expose only that file,
+or a directory for a page with nearby assets. Shares survive
 MCP shutdown; inspect them through either interface and stop an individual ID.
 Reusing a key or backend port replaces the corresponding existing share.
 
@@ -388,7 +400,8 @@ Omitting the key generates the same 32 random hex characters. These URLs provide
 obscurity, not authentication; use access control when authentication is needed.
 In MCP, the corresponding requests are `expose_files(path="site", key="release-preview")`
 and `expose_files(path="report.pdf", update_mode="snapshot", key=publication_key)`;
-relative paths resolve from the project root even when the client starts below it.
+relative paths resolve from the alias installation root even when the client
+starts in another project. Use absolute paths for that project's files.
 
 | Update mode | Behavior |
 | --- | --- |
@@ -547,8 +560,6 @@ You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config fil
 - `scripts/share_contract.py`: Typed share/error results and JSON serialization.
 - `scripts/mcp_server.py`, `scripts/mcp.sh`: Official SDK stdio tools and prepared
   interpreter entrypoint.
-- `deploy/mcp/codex.config.toml`, `.mcp.json`, `scripts/prepare_mcp.py`: Portable
-  client registrations and preparation of the ignored local `.codex/config.toml`.
 - `scripts/publication.py`, `scripts/reload.js`: Private static copies, native
   publication events and reload behavior injected into served live HTML.
 - `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py`: Pinned local

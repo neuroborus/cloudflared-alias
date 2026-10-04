@@ -685,6 +685,30 @@ for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         self.assert_preserved(snapshot, pids)
         self.assertEqual(self.success("list-shares"), [survivor])
 
+    def test_signal_during_file_template_render_rolls_back_and_preserves_survivor(self):
+        survivor = self.success("expose-port", "3000", "--key", "keep")
+        snapshot = self.saved_state()
+        pids = [pid for pid in self.daemon_pids() if running(pid)]
+        launcher = self.project / "scripts/tunnel.sh"
+        original = launcher.read_text()
+        boundary = "yaml_quote() {"
+        self.assertEqual(original.count(boundary), 1)
+        self.addCleanup(launcher.write_text, original)
+        # Signal the parent while it expands a candidate template's quoted value.
+        for variable in ("TUNNEL_NAME_VALUE", "CREDENTIALS_FILE_VALUE"):
+            with self.subTest(variable=variable):
+                interrupt = f'''
+  if [[ -n "${{CURRENT_PUBLICATION_DIR:-}}" && "$1" == "${{{variable}}}" ]]; then kill -TERM "$$"; fi
+'''
+                launcher.write_text(original.replace(boundary, boundary + interrupt))
+                result = self.invoke("expose-files", str(self.content), "--update-mode", "snapshot", "--key", "keep")
+                self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+                self.assertIn("error", json.loads(result.stdout))
+                self.assertNotIn("unexpected EOF", result.stderr)
+                self.assertFalse(list((self.runtime / "publications").iterdir()))
+                self.assert_preserved(snapshot, pids)
+                self.assertEqual(self.success("list-shares"), [survivor])
+
     def test_failed_file_stop_preserves_helper_and_successful_stop_prunes_stale_helpers(self):
         shares = [self.success("expose-files", str(self.content), "--update-mode", "manual") for _ in range(2)]
         snapshot = self.saved_state()

@@ -14,6 +14,10 @@ from pydantic import Field, PlainValidator, TypeAdapter
 from share_contract import ErrorResult, ShareResult, UpdateMode, UrlMode
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_GUIDANCE = (
+    f"Relative file paths resolve from the alias installation root ({ROOT}). "
+    "Use absolute paths for files in other projects."
+)
 GUIDANCE = (
     "Always provide a key instead of returning a bare-domain URL. Prefer path mode "
     "with a meaningful and useful slug for ordinary content. For potentially sensitive "
@@ -29,8 +33,8 @@ server = MCPServer(
     instructions=(
         "Expose local ports or one selected static file/directory through the existing "
         "named tunnel. The alias owns shares; ending this MCP session leaves them running. "
-        "Use list_shares and stop_share to inspect and stop individual IDs. Relative file "
-        "paths resolve from the project root. File inputs expose no adjacent assets; "
+        "Use list_shares and stop_share to inspect and stop individual IDs. "
+        + SOURCE_GUIDANCE + " File inputs expose no adjacent assets; "
         "select a directory for a page and its assets. File updates default to live "
         "(native events and HTML reload); manual reads on request, snapshot freezes copies "
         "until republication. Sources remain unchanged. Reusing a key or backend port "
@@ -50,7 +54,7 @@ Key = Annotated[str, PlainValidator(
 )]
 SourcePath = Annotated[str, Field(
     min_length=1, pattern=r"^[^\x00\r\n\t]+$",
-    description="One file or recursive directory; relative to the project root. No symlinks.",
+    description="One file or recursive directory. " + SOURCE_GUIDANCE + " No symlinks.",
 )]
 ShareId = Annotated[str, Field(
     min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$",
@@ -119,7 +123,7 @@ async def expose_port(
 
 @server.tool(description=(
     "Expose exactly one static file or recursive directory, preserving original sources. "
-    "Relative paths resolve from the project root; no adjacent file discovery or symlinks. "
+    + SOURCE_GUIDANCE + " No adjacent file discovery or symlinks. "
     "Live (default) publishes native file changes and reloads served HTML over SSE; "
     "manual reads current bytes on request; snapshot freezes bytes until republication. "
     "Other formats display or download normally and get live updates on refresh. " + GUIDANCE

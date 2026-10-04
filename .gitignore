@@ -17,5 +17,5 @@ __pycache__/
 /.tools/
 /.venv/
 
-# Generated project-local Codex MCP registration; the template stays tracked
+# Legacy project-local MCP registration; user-level setup is documented in README
 /.codex/config.toml

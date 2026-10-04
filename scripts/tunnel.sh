@@ -389,13 +389,18 @@ next_caddy_port() {
 yaml_quote() { local value="${1//\'/\'\'}"; printf "'%s'" "$value"; }
 escape_sed() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
 render_template() {
-  local template="$1" output="$2"
+  local template="$1" output="$2" tunnel credentials
+  # Nested substitutions can corrupt Bash's parser when a signal trap interrupts them.
+  tunnel="$(yaml_quote "$TUNNEL_NAME_VALUE")"
+  tunnel="$(escape_sed "$tunnel")"
+  credentials="$(yaml_quote "$CREDENTIALS_FILE_VALUE")"
+  credentials="$(escape_sed "$credentials")"
   sed -e "s|__CADDY_PORT__|${CADDY_PORT}|g" \
     -e "s|__BACKEND_PORT__|${BACKEND_PORT}|g" \
     -e "s|__PATH_ID__|${PATH_ID}|g" \
     -e "s|__SUBDOMAIN_HOST__|${ROUTE_HOST}|g" \
-    -e "s|__TUNNEL_NAME__|$(escape_sed "$(yaml_quote "$TUNNEL_NAME_VALUE")")|g" \
-    -e "s|__CREDENTIALS_FILE__|$(escape_sed "$(yaml_quote "$CREDENTIALS_FILE_VALUE")")|g" \
+    -e "s|__TUNNEL_NAME__|${tunnel}|g" \
+    -e "s|__CREDENTIALS_FILE__|${credentials}|g" \
     "$template" > "$output"
 }
 render_file_template() {
