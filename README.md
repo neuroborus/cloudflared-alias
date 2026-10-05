@@ -1,6 +1,112 @@
 # cloudflared-alias
 
-Cloudflare Tunnel with a local Caddy gate: share a backend via a keyed URL (path or subdomain) without changing the app.
+Cloudflare Tunnel with a local Caddy gate: share a backend or selected static files via a keyed URL (path or subdomain).
+
+## Quickstart
+
+### 1. Install
+
+Use Linux x86_64 with Python 3.11+ and the [build prerequisites](#prerequisites).
+Install the pinned cloudflared release listed there using the
+[official downloads](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/).
+Then clone and prepare the local Python, Caddy and dependencies:
+
+```bash
+git clone https://github.com/neuroborus/cloudflared-alias.git
+cd cloudflared-alias
+bash scripts/setup.sh
+export PATH="$PWD/.venv/bin:$PWD/.tools/caddy/usr/bin:$PATH"
+bash scripts/check-env.sh --cloudflared "$(command -v cloudflared)"
+```
+
+Run commands below from this repository root. Repeat the PATH export in each
+new shell, or use the [shell shortcut](#shell-shortcut). Setup installs into
+ignored `.tools/` and `.venv/`; it does not change system packages or register MCP.
+
+### 2. Configure your named tunnel
+
+Use a locally managed named Cloudflare tunnel with a DNS record for your chosen
+hostname. The launcher reads `~/.cloudflared/config.yml` for its tunnel identity,
+credentials-file path and ingress hostname. If you already have these, reuse
+them; otherwise follow [Named tunnel setup](#named-tunnel-setup).
+Set `CLOUDFLARED_BASE_CONFIG` for a different config path.
+
+The launcher starts the local Caddy gate and tunnel connector itself. File
+exposure needs no separate web server or prior port exposure.
+
+### 3. Publish a page or local backend
+
+Publish any single HTML file in the default `live` mode:
+
+```bash
+demo_dir="$(mktemp -d)"
+cat > "$demo_dir/hello.html" <<'HTML'
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Hello</title></head>
+  <body><h1>Hello from cloudflared-alias</h1></body>
+</html>
+HTML
+./scripts/tunnel.sh expose-files "$demo_dir/hello.html" --key html-test
+```
+
+Open the JSON result's `url`, for example `https://preview.example.com/html-test/`.
+The source can have any filename; its name is not appended to the returned URL.
+Edit the file to update open browser tabs automatically over SSE. If automatic
+reload is unavailable, refresh the page to get current content. Select a directory
+instead when the page needs nearby assets. See [Static file shares](#static-file-shares)
+for `manual` and `snapshot` modes and other file formats.
+
+To share an already running HTTP backend on port 3000:
+
+```bash
+./scripts/tunnel.sh expose-port 3000 --key app-preview
+```
+
+Both commands return JSON with an `id` and `url`; save the `id` for per-share
+stopping. The backend example returns a URL such as
+`https://preview.example.com/app-preview/`; append backend routes such as `swagger`
+to that base URL. Shares detach and keep running after the shell or agent session
+ends.
+Use a meaningful key for ordinary content; omit it to generate a random opaque
+key for sensitive or uncertain content. A key provides obscurity, not authentication.
+
+### 4. List and stop publications
+
+```bash
+./scripts/tunnel.sh list-shares
+./scripts/tunnel.sh stop-share 9090.Abc123  # Replace with the returned share id
+```
+
+Stopping one share preserves the others. [Stop and restart](#stop-and-restart)
+also describes foreground operation and stopping every owned share.
+
+### 5. Let agents use MCP
+
+Register once for your user in whichever clients you use, from this repository root:
+
+```bash
+codex mcp add cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
+claude mcp add --transport stdio --scope user cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
+```
+
+Start a new client session. Agents in any project can use `expose_port`,
+`expose_files`, `list_shares` and `stop_share`. For another project's files, pass
+absolute paths; MCP relative paths resolve from this alias installation root.
+See [MCP for all projects](#mcp-for-all-projects) for registration, migration
+and tool arguments.
+
+## Reference
+
+- [Prerequisites and named tunnel setup](#prerequisites)
+- [Commands and flags](#commands-and-flags)
+- [MCP for all projects](#mcp-for-all-projects)
+- [Static file shares and update modes](#static-file-shares)
+- [URL modes](#modes) and [configuration](#config-file-defaults)
+- [Parallel runs and recovery](#parallel-runs-and-conflicts), [stopping](#stop-and-restart) and [history](#history-interactive-pick)
+- [Shell shortcut](#shell-shortcut) and [pinned local setup](#pinned-local-setup)
+- [Troubleshooting](#troubleshooting)
+- [Development and Agent Runner](#development-and-agent-runner)
 
 ## Commands and flags
 
@@ -8,57 +114,292 @@ Cloudflare Tunnel with a local Caddy gate: share a backend via a keyed URL (path
 |----------------|-------------|
 | `--help`, `-h` | Show usage and exit. |
 | `--list`, `-l` | Show last 10 tunnels and pick one interactively (run without port). |
-| `stop` | Stop all Caddy instances and cloudflared. |
-| `-p`, `--path` | Path mode (default): key in URL path. |
-| `-s`, `--subdomain` | Subdomain mode: key in hostname. |
-| `-n`, `--no-key` | No key: share URL = `https://<hostname>/`. |
+| `stop` | Stop all launcher-owned shares and their shared cloudflared connector. |
+| `expose-port PORT [--url-mode MODE] [--key KEY]` | Expose a port, detach and return one JSON share result. |
+| `expose-files PATH [--url-mode MODE] [--update-mode MODE] [--key KEY]` | Expose one file or directory, detach and return a JSON result; defaults to live updates. |
+| `list-shares` | Return a JSON array of active launcher-owned shares without prompts. |
+| `stop-share ID` | Stop only the identified share and return its result with `state: "stopped"`. |
+| `-p`, `--path` | Legacy CLI path mode (default): key in URL path. |
+| `-s`, `--subdomain` | Legacy CLI subdomain mode: key in hostname. |
+| `-n`, `--no-key` | Legacy CLI no-key mode: share URL = `https://<hostname>/`. |
 
 Examples: `./scripts/tunnel.sh -h` (help), `./scripts/tunnel.sh -l` (pick from history), `./scripts/tunnel.sh 3000` (start tunnel), `./scripts/tunnel.sh stop` (stop all).
 
-## Quickstart
-
-1. Install Caddy:
+### Structured share control
 
 ```bash
-# Debian/Ubuntu example:
-sudo apt update
-sudo apt install -y caddy
+./scripts/tunnel.sh expose-port 3000 --key release-preview
+./scripts/tunnel.sh expose-port 3001 --url-mode subdomain --key api-preview
+./scripts/tunnel.sh expose-files ./site --key release-preview
+./scripts/tunnel.sh expose-files ./report.pdf --update-mode snapshot --key report
+./scripts/tunnel.sh list-shares
+./scripts/tunnel.sh stop-share 9090.Abc123  # Use the returned id
 ```
 
-2. Install cloudflared (if not installed):  
-   https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-3. Ensure your named tunnel exists in `~/.cloudflared/config.yml` with `tunnel`, `credentials-file` and `hostname:`.
-4. Start your backend locally (example: `localhost:3000`).
-5. Run (default is **path** mode with a random key):
+These commands write JSON to stdout and diagnostics to stderr. Exposure always
+detaches, so the share survives the invoking process. Results identify the
+individual instance rather than the shared last-URL file:
+
+```json
+{"id":"9090.Abc123","url":"https://example.test/release-preview/","source":{"type":"port","port":3000},"url_mode":"path","update_mode":null,"state":"active"}
+```
+
+IDs come from unique instance-directory names and remain stable until a share
+is stopped or replaced. Reusing a backend port or key replaces its previous
+share; starting another explicit `no-key` share replaces the previous no-key
+share. A failed replacement preserves the prior working share. Stopping one
+share refreshes the shared connector's ingress while preserving other Caddy
+instances; a failed refresh restores the prior registry and connector. Stopping
+the last share stops the owned connector. Unknown or unowned IDs fail without
+changing shares. Failures exit nonzero and return
+`{"error":{"code":"launcher_error","message":"..."}}`; an unknown active ID
+uses `unknown_share` as its code.
+
+The structured exposure default is always `path`, independently of legacy
+`DEFAULT_MODE`, `DETACH` and `ID_LENGTH`. Omitted keys use
+`secrets.token_hex(16)` (32 hex characters); explicit keys follow the existing
+1–32 character lowercase alphanumeric/hyphen rules, with no leading or trailing
+hyphen. Bare-domain access requires `--url-mode no-key`, which cannot be combined
+with `--key`. Prefer useful keyed paths for ordinary content, and opaque random
+keys when the slug could reveal
+sensitive details. A key provides obscurity, not authentication.
+
+Listing includes legacy instances, derives each URL from its persisted routing
+data and does not migrate registry rows or consult interactive history. Caddy
+instances with a missing owned connector or file helper have `state: "degraded"`; stale or
+unowned Caddy entries are omitted. Listing and individual stopping need no
+source Cloudflare configuration or credentials. The original positional CLI,
+four-character legacy keys, foreground behavior, interactive history and
+stop-all remain available.
+
+Share commands prefer the prepared `.venv/bin/python3`, falling back to
+`python3` on PATH. Set `ALIAS_PYTHON` to select another prepared interpreter;
+this option accepts an executable path, including spaces, rather than a shell
+command. The legacy positional interface does not require this Python helper.
+
+### MCP for all projects
+
+Prepare the pinned runtime from this repository root:
 
 ```bash
-./scripts/tunnel.sh 3000
+bash scripts/setup.sh
 ```
 
-6. Open the printed share URL and append your route (e.g. `/swagger`). See **Commands and flags** above for `-n`, `-s`, `-l`, `-h`; **Modes** below for details.
-
-Optional alias for faster startup:
+Register the server once for your user in each client you use, from the same
+repository root:
 
 ```bash
-echo 'alias tunnel-share="cd $HOME/path/to/cloudflared-alias && ./scripts/tunnel.sh"' >> ~/.bashrc
-source ~/.bashrc
+codex mcp add cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
+claude mcp add --transport stdio --scope user cloudflared_alias -- bash "$PWD/scripts/mcp.sh"
 ```
 
-Then run:
+Codex stores the registration in its user configuration; Claude Code uses user
+scope. New client sessions discover the tools in any project or subdirectory.
+The clients launch the server automatically; no standalone service is required.
+To inspect the registrations, use `codex mcp get cloudflared_alias` or
+`claude mcp get cloudflared_alias`. Restart an existing client session after
+registration. If the alias installation moves, rerun registration from its new
+root; first remove Claude Code's old user registration with
+`claude mcp remove --scope user cloudflared_alias`.
+
+Runtime dependencies remain in the alias installation's `.tools/` and `.venv/`.
+Setup prepares only those dependencies, without changing client configuration.
+The absolute wrapper path makes startup independent of the client's working
+directory. The wrapper resolves its own root, selects `.venv/bin/python3`
+(or the `ALIAS_PYTHON` environment override) and adds the prepared local Caddy
+to PATH. It fails explicitly if Python is missing.
+
+When upgrading from the former project-only setup, remove only the alias's
+`[mcp_servers.cloudflared_alias]` entry from the local `.codex/config.toml` so
+it cannot override the user registration. Project `.mcp.json` registration is
+no longer part of this repository.
+
+The server's only transport is stdio; MCP control is never exposed through the
+public tunnel. Exposure reuses the existing named tunnel configuration and
+requires the same operator setup as the CLI. Tunnel configuration and share
+state belong to the alias installation, regardless of the client's project.
+
+| Tool | Arguments |
+| --- | --- |
+| `expose_port` | `port`, `url_mode="path"`, `key=None` |
+| `expose_files` | `path`, `url_mode="path"`, `update_mode="live"`, `key=None` |
+| `list_shares` | none |
+| `stop_share` | `id` |
+
+Tools advertise port bounds, key/path constraints and mode enums. Exposure and
+stopping return the CLI's typed share descriptor in MCP `structuredContent`;
+listing returns `{"shares": [...]}`. Launcher failures return
+`{"error":{"code":"...","message":"..."}}` with MCP `isError: true`.
+Schema validation failures are SDK tool errors. Diagnostics go to stderr.
+Each result belongs to its request, including concurrent exposures; no tool
+reads shared last-URL files or interactive history.
+
+Use absolute file paths for content in other projects; relative paths resolve
+from the alias installation root. Select one file to expose only that file at
+the returned trailing-slash root URL, regardless of its filename, or a directory
+for a page with nearby assets. Shares survive
+MCP shutdown; inspect them through either interface and stop an individual ID.
+Reusing a key or backend port replaces the corresponding existing share.
+
+Always provide a key instead of returning a bare-domain URL. Prefer path mode
+with a meaningful and useful slug for ordinary content. For potentially sensitive
+or uncertain content, use a cryptographically random opaque key; use an opaque
+random key as the fallback when no suitable meaningful key has been chosen.
+Do not put sensitive details into a meaningful slug. Omitted keys generate
+32 random hex characters; `no-key` requires an explicit selection and cannot
+be combined with a key. A key provides obscurity, not authentication or access control.
+
+Registration syntax follows the official [Codex MCP configuration](https://developers.openai.com/codex/mcp/)
+and [Claude Code MCP configuration](https://code.claude.com/docs/en/mcp).
+Regression tests use the pinned official SDK client over real stdio with
+synthetic tunnel configuration. Integration coverage uses actual local Caddy
+and publication helpers with mocked cloudflared.
+
+### Static file shares
+
+Supply exactly one regular file or directory. A file exposes only that selection
+at the returned trailing-slash root URL, including files with names other than
+`index.html`; a directory exposes its recursive static assets at a base URL.
+Select the directory when an HTML page needs nearby CSS, JavaScript or images.
+The launcher does not discover dependencies, execute applications or convert
+formats. Symlinks, the launcher root and internal metadata
+are rejected; directory copies omit VCS and launcher metadata. Originals remain
+unchanged. The prepared interpreter and pinned dependencies are required for
+manual and live helpers.
+
+For a page with assets, select the containing directory:
+
+```text
+site/
+  index.html
+  assets/style.css
+  assets/image.svg
+```
 
 ```bash
-tunnel-share 3000
+# Live directory: edits to HTML or assets also refresh open HTML pages.
+./scripts/tunnel.sh expose-files ./site --key release-preview
+# Manual directory: each request reads current bytes; refresh the browser yourself.
+./scripts/tunnel.sh expose-files ./site --update-mode manual --key manual-preview
+# Snapshot of exactly one file; sibling assets are outside this selection.
+./scripts/tunnel.sh expose-files ./site/index.html --update-mode snapshot --key saved-page
+# Republish after an edit by repeating the same selection and key.
+./scripts/tunnel.sh expose-files ./site/index.html --update-mode snapshot --key saved-page
+# The same update modes also work under a keyed hostname.
+./scripts/tunnel.sh expose-files ./site --url-mode subdomain --key site-preview
 ```
+
+With `example.test` as the configured hostname, the first share has base URL
+`https://example.test/release-preview/`; the selected snapshot file has URL
+`https://example.test/saved-page/`. Selecting `./site/preview.html` with key
+`html-test` likewise serves that file at `https://example.test/html-test/`.
+Its sibling `assets/style.css` is not published. Use relative asset URLs such as
+`assets/style.css` in path mode: `/assets/style.css` escapes the key prefix and
+does not reach that share. Nested pages can use `../assets/style.css`.
+Directory redirects retain the prefix and query.
+The subdomain example has base URL `https://site-preview.example.test/` and
+requires the [wildcard DNS and TLS setup](#named-tunnel-setup). Bare-domain
+publishing requires the explicit `--url-mode no-key` choice.
+
+Single-file roots work for HTML, PDF, images, archives and other static formats.
+Responses keep the selected filename's MIME type and supply its encoded download
+filename without forcing a download. The original filename and bytes stay
+unchanged; only live HTML copies receive the reload script. The percent-encoded
+filename URL remains an alias to the same file. Existing managed shares without
+root routing retain their filename URLs when listed or stopped; they are not
+migrated while running. Republish to use the new root URL default.
+
+For sensitive or uncertain content, choose a cryptographically random opaque
+key without embedding sensitive details. This also supplies a fallback when
+there is no useful meaningful slug:
+
+```bash
+publication_key="$(.venv/bin/python3 -c 'import secrets; print(secrets.token_hex(16))')"
+./scripts/tunnel.sh expose-files ./report.pdf --update-mode snapshot --key "$publication_key"
+```
+
+Omitting the key generates a fresh 32-character random hex key. These URLs provide
+obscurity, not authentication; use access control when authentication is needed.
+In MCP, the corresponding requests are `expose_files(path="site", key="release-preview")`
+and `expose_files(path="report.pdf", update_mode="snapshot", key=publication_key)`;
+relative paths resolve from the alias installation root even when the client
+starts in another project. Use absolute paths for that project's files.
+
+| Update mode | Behavior |
+| --- | --- |
+| `live` (default) | Native file events publish new copies; served HTML subscribes over SSE and reloads on a content revision. Other formats get new bytes on refresh. |
+| `manual` | Each GET/HEAD request prepares current source bytes before Caddy serves them; no watcher or injected script. Refresh an open page to see changes. |
+| `snapshot` | Copied bytes stay frozen, even on refresh. Expose the source again with the same key to replace the snapshot. |
+
+URL mode is independent of update mode: all three update modes support path,
+subdomain and explicit no-key routing. Structured results include a canonical
+`source` with `type: "file"` or `"directory"`, `update_mode`, and available
+`source_revision` and `revision` hashes. Listing reports current accepted revisions
+without reopening missing sources. File shares are excluded from interactive port
+history. Reusing a key replaces its share, including across file and port shares;
+selecting the same source with different keys creates independent shares.
+
+Manual/live responses use `Cache-Control: no-store`. Subscription failures leave
+live publications updating and refresh serves current accepted bytes. Server-side
+preparation failures retain the last successful copy. If a helper exits, listing
+reports degraded state while Caddy keeps serving accepted bytes; stop and expose
+the share again to recover the helper.
+
+Live HTML uses an inline reload script and a same-origin `EventSource` connection
+to `<base URL>__alias/events`. A Content Security Policy that blocks inline
+scripts or the SSE connection prevents automatic reload; ordinary refresh still
+reads the latest accepted publication. PDF and other non-HTML viewers refresh
+manually even in live mode. Native inotify updates continue without subscribers;
+neither filesystem revision polling nor browser revision polling is used. Each
+SSE connection/reconnection receives the current accepted revision after its
+bytes are ready; comment heartbeats do not reload pages. This requires a named
+Cloudflare tunnel: Quick Tunnels do not support SSE.
+
+Custom Cloudflare Cache Rules must bypass caching for manual/live content and
+the event endpoint, preserving `Cache-Control: no-store`. Match the entire keyed
+path prefix in path mode, or the publication hostname in subdomain/no-key mode.
+Avoid buffering or compressing the event stream in an added proxy. If you choose
+to cache snapshots at the edge, purge a reused snapshot URL when republishing
+or choose a new key; a local new copy cannot invalidate custom edge caches.
+
+The launcher prepares publications and waits for helper readiness inside its
+existing startup transaction before installing the route. Failed or interrupted
+startup removes only the candidate's owned helper and managed publication state.
+Replacement, per-share stopping, stop-all and stale-Caddy pruning stop verified
+helper processes and remove that share's publications, without deleting source
+paths or affecting other shares. Shares survive the caller exiting; only routing
+changes refresh the shared connector. See [Static publication internals](#static-publication-internals)
+for copy, helper and revision details.
+
+## Shell shortcut
+
+Add this Bash function to your `~/.bashrc`, replacing the installation path:
+
+```bash
+pf() {
+  local alias_root="$HOME/path/to/cloudflared-alias"
+  PATH="$alias_root/.venv/bin:$alias_root/.tools/caddy/usr/bin:$PATH" \
+    "$alias_root/scripts/tunnel.sh" "$@"
+}
+```
+
+Reload the shell with `source ~/.bashrc`, then use `pf expose-port 3000 --key app-preview`
+or `pf expose-files /absolute/path/to/page.html --key html-test` from any directory.
+CLI relative source paths resolve from the caller's working directory; MCP relative
+paths resolve from the alias installation root. The function selects the prepared
+Caddy without changing the working directory or the shell's global PATH.
 
 ## Modes
 
-Default mode is **path** (key in URL path). Override with `-p` / `-s` / `-n` or via config (see **Config file**).
+Structured share commands use **path** by default; select another mode with
+`--url-mode`. The legacy positional CLI uses `DEFAULT_MODE` from the
+[config file](#config-file-defaults), initially `path`, or an explicit mode flag.
 
-| Mode | Flag | URL |
-|------|------|-----|
-| **path** (default) | `-p` / `--path` | `https://<hostname>/<key>/` — key in path; Caddy strips it before proxying. |
-| **subdomain** | `-s` / `--subdomain` | `https://<key>.<domain>/` — key in hostname; Swagger/relative URLs work without backend changes. |
-| **no-key** | `-n` / `--no-key` | `https://<hostname>/` — no key; all routes as-is (e.g. for quick local share). |
+| Mode | Structured option | Legacy flag | URL |
+| --- | --- | --- | --- |
+| **path** (default) | `--url-mode path` | `-p` / `--path` | `https://<hostname>/<key>/` — Caddy strips the key prefix before proxying. |
+| **subdomain** | `--url-mode subdomain` | `-s` / `--subdomain` | `https://<key>.<domain>/` — key in hostname; backend paths remain unchanged. |
+| **no-key** (explicit) | `--url-mode no-key` | `-n` / `--no-key` | `https://<hostname>/` — no key or path stripping. |
 
 Examples:
 
@@ -69,16 +410,25 @@ Examples:
 ./scripts/tunnel.sh -p 3000 mykey     # path, key "mykey"
 ```
 
-**When to use which:** In most cases **subdomain** is preferable — Swagger and any relative URLs work without backend changes. It requires **wildcard setup in Cloudflare** (DNS and tunnel hostname for `*.<domain>`), and for HTTPS on multi-level subdomains (`<key>.<domain>`) Cloudflare does not issue a certificate by default: either extra setup/overhead (e.g. custom certificate) or a **paid plan** (Total TLS / Advanced Certificate Manager). So **path** is the default — it works with free Universal SSL and no wildcard.
+Prefer useful keyed paths for ordinary content. **Subdomain** mode is useful for
+backends whose pages use root-relative URLs such as `/swagger`: the key stays in
+the hostname, so these URLs keep the same origin without escaping a path prefix.
+It requires wildcard DNS for `*.<domain>` and TLS coverage for the generated
+hostnames. Cloudflare Universal SSL normally covers `*.example.com`, but not
+`*.preview.example.com`; a key under `preview.example.com` therefore needs
+additional certificate coverage, such as Advanced Certificate Manager or a
+custom certificate. Path mode needs no wildcard and can use a hostname already
+covered by Universal SSL. Keep **no-key** an explicit choice.
 
 ## What this feature does
 
 - Keeps your backend unchanged (e.g. `/swagger` stays `/swagger`).
 - Runs Caddy locally in front of the backend.
-- Generates a fresh random key on each run.
-- **Subdomain mode:** exposes the app at `https://<key>.<domain>/...`; requests use the same origin, so Swagger "Try it out" and all relative URLs work by default.
+- Generates a fresh random key in path/subdomain mode when no key is provided.
+- **Subdomain mode:** exposes the app at `https://<key>.<domain>/...`; root-relative URLs stay on the keyed hostname.
 - **Path mode:** exposes at `https://<hostname>/<key>/...`; Caddy strips `/<key>` before proxying.
-- Returns `404` for requests that don’t match the current key (wrong subdomain or path).
+- Returns `404` for requests that don’t match a keyed route, unless a no-key
+  instance provides a fallback on that hostname.
 
 ## Why Caddy
 
@@ -87,50 +437,125 @@ Caddy is used as a lightweight local reverse proxy because it makes path matchin
 ## Architecture
 
 ```text
-Internet -> Cloudflare Tunnel -> Caddy -> Local backend
+Internet -> Cloudflare Tunnel -> Caddy -> Local backend or managed static copies
 ```
 
 ## Prerequisites
 
-- Linux + `bash`
-- [`caddy`](https://caddyserver.com/docs/install)
-- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-- An existing named Cloudflare tunnel config with `tunnel:`, `credentials-file:` and `hostname:`. By default the script reads `~/.cloudflared/config.yml`; to use another file set `CLOUDFLARED_BASE_CONFIG=/path/to/config.yml`.
-  - **Path / no-key:** one hostname in config (e.g. `local.hasso.tech`). One CNAME in DNS.
-  - **Subdomain:** wildcard hostname (e.g. `*.local.hasso.tech`) and DNS wildcard; domain is derived from this.
+- Linux x86_64 with Bash, Git and bootstrap Python 3.11+.
+- Build tools: `cc`/GCC, `make`, `ar`, `tar`, `xz`, plus OpenSSL, zlib,
+  libffi and bzip2 development headers. ShellCheck is required for validation.
+  On Debian/Ubuntu, these are provided by `build-essential`, `binutils`,
+  `xz-utils`, `libssl-dev`, `zlib1g-dev`, `libffi-dev`, `libbz2-dev` and `shellcheck`,
+  in addition to `git`, `python3` and `iproute2`.
+- Standard Linux utilities, including `awk`, `sed`, `tr`, `head`, `tail`, `nohup`, `mktemp` and
+  `flock` (util-linux), plus `ss` (iproute2) or `netstat` to detect busy ports.
+- Caddy 2.11.7, prepared locally with `scripts/setup.sh` (see [Pinned local setup](#pinned-local-setup)).
+- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) 2026.9.3; setup does not install or upgrade the connector.
+- A locally managed named Cloudflare tunnel config with `tunnel:`, `credentials-file:` and an ingress `hostname:`. By default the script reads `~/.cloudflared/config.yml`; to use another file set `CLOUDFLARED_BASE_CONFIG=/path/to/config.yml`.
+  - **Path / no-key:** a concrete hostname (e.g. `preview.example.com`) and its DNS record pointing to the tunnel.
+  - **Subdomain:** wildcard DNS for `*.<domain>` and matching TLS coverage. The domain is derived from the source hostname, removing an optional `*.` prefix, or set with `SUBDOMAIN_DOMAIN`.
+
+### Named tunnel setup
+
+Use a domain whose DNS is managed by your Cloudflare account. If no locally
+managed tunnel exists yet, follow Cloudflare's
+[local tunnel setup](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/create-local-tunnel/):
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create preview-tunnel
+cloudflared tunnel route dns preview-tunnel preview.example.com
+```
+
+Replace `preview.example.com` with your hostname. Note the UUID and credentials
+path printed by `create`; the DNS command creates the hostname's CNAME.
+Create `~/.cloudflared/config.yml` using your actual values:
+
+```yaml
+tunnel: YOUR-TUNNEL-UUID
+credentials-file: /home/YOUR-USER/.cloudflared/YOUR-TUNNEL-UUID.json
+ingress:
+  - hostname: preview.example.com
+    service: http://127.0.0.1:9090
+  - service: http_status:404
+```
+
+Use an absolute credentials path. The launcher also expands `~/` and resolves
+relative credential paths from the source config's directory. Keep the
+credentials file private. The alias reads the tunnel identity and hostname from
+this source and renders its own ingress for the selected Caddy listeners, so
+the example service port does not need a separate backend. Start exposure with
+the alias; you do not need to run `cloudflared tunnel run` separately.
+For an existing tunnel, reuse its identity, credentials and DNS rather than
+recreating it. See Cloudflare's
+[DNS routing reference](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/dns/)
+for DNS management. For subdomain mode under `preview.example.com`, also create
+the wildcard DNS record:
+
+```bash
+cloudflared tunnel route dns preview-tunnel '*.preview.example.com'
+```
+
+The launcher renders ingress for each keyed hostname. Provide the TLS coverage
+described in [Modes](#modes) before using those URLs.
 
 ## Config file (defaults)
 
-**`cloudflared-alias.conf`** in the project root holds defaults. Key=value, one per line; `#` = comment. Env vars override.
+**`cloudflared-alias.conf`** in the project root holds defaults. Use `KEY=value`,
+one per line. Lines starting with `#` and unquoted inline comments after whitespace
+are ignored; single or double quotes preserve spaces and `#` in values. Environment
+variables override the file, and the last file value wins for duplicate options.
+Unknown options and invalid values produce an error.
 
 Common options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `DEFAULT_MODE` | `path` | Default mode when no `-p`/`-s`/`-n`: `path`, `subdomain`, `no-key` |
-| `CADDY_PORT` | `9090` | Port Caddy listens on (cloudflared forwards here) |
-| `ID_LENGTH` | `4` | Length of random key when not provided |
-| `DETACH` | `0` | `1` = run in background |
+| `DEFAULT_MODE` | `path` | Legacy CLI default when no `-p`/`-s`/`-n`: `path`, `subdomain`, `no-key` |
+| `CADDY_PORT` | `9090` | Starting port for selecting a free Caddy listener (cloudflared forwards here) |
+| `ID_LENGTH` | `4` | Legacy CLI random key length (1–32); structured commands use 32 hex characters |
+| `DETACH` | `0` | Legacy CLI: `1` = run in background; structured exposure always detaches |
+| `ALIAS_PYTHON` | `.venv/bin/python3` if available, else `python3` | Interpreter for structured share commands |
 
 You can also set `SUBDOMAIN_DOMAIN`, `CLOUDFLARED_BASE_CONFIG` in the config file.
 
 ## File overview
 
 - `scripts/tunnel.sh`: Main entrypoint.
+- `scripts/share_contract.py`: Typed share/error results and JSON serialization.
+- `scripts/mcp_server.py`, `scripts/mcp.sh`: Official SDK stdio tools and prepared
+  interpreter entrypoint.
+- `scripts/publication.py`, `scripts/reload.js`: Private static copies, native
+  publication events and reload behavior injected into served live HTML.
+- `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py`: Pinned local
+  installation and environment verification; shared offline preparation for checks.
+- `pyproject.toml`, `requirements.lock`, `.python-version`: Python dependency and runtime pins.
+- `deploy/toolchain.json`: Verified artifact URLs, hashes, sizes and runtime versions.
 - `cloudflared-alias.conf`: Defaults (edit to change DEFAULT_MODE, CADDY_PORT, etc.).
 - `deploy/caddy/Caddyfile.template`: Caddy (path with key).
 - `deploy/caddy/Caddyfile.subdomain.template`: Caddy (subdomain).
 - `deploy/caddy/Caddyfile.path-nokey.template`: Caddy (path, no key).
+- `deploy/caddy/Caddyfile.files.{path,subdomain,nokey}.template`: Static routes, manual preparation and live event proxy.
 - `deploy/cloudflared/config.template.yml`: Cloudflared template rendered at runtime.
-- `.runtime/registry`: List of running tunnel instances (key, port, Caddy port, PIDs).
-- `.runtime/instances/<port>/`: Per-instance Caddy config, PID, and log (one dir per running tunnel).
+- `.runtime/registry`: Tab-delimited running instances (mode, key, backend port,
+  Caddy port, Caddy PID, instance directory and hostname); file shares use `0`
+  in the backend field and do not conflict by source or backend port.
+- `.runtime/instances/<caddy-port>.<suffix>/`: Per-instance Caddy config, PID, log
+  and private Caddy data/config directories. Each run gets a unique directory;
+  structured exposures also persist their initial descriptor in `share.json`.
+  The registry and verified process ownership determine current active state.
+- `.runtime/publications/<id>/`: Managed file generations and `public/` link;
+  private `helper.json`, log, helper PID/port and `ready.json` stay outside the
+  served root. Snapshot shares have no persistent helper.
+- `.runtime/launcher.lock`: Serializes start, stop and shared-state updates.
 - `.runtime/cloudflared/config.yml`: Rendered cloudflared config (multi-ingress to all instance ports).
 - `.runtime/current-share-url.txt`: Current generated share URL.
 - `.runtime/current-path-id.txt`: Current generated prefix ID.
 - `.runtime/cloudflared/cloudflared.log`: Cloudflared log.
 - `.runtime/tunnel-history`: Last 10 tunnels (for `--list` / `-l`).
 
-## How to run
+## How to run (legacy CLI)
 
 1. Ensure your backend is running locally (example: `localhost:3000`).
 2. Run:
@@ -147,34 +572,28 @@ Pass a key after the port to use it; otherwise a random key is generated (path/s
 ./scripts/tunnel.sh 3000        # path, random key
 ./scripts/tunnel.sh 3000 mykey  # path, key "mykey"
 ./scripts/tunnel.sh -n 3000     # no key
-./scripts/tunnel.sh -s 3000      # subdomain
+./scripts/tunnel.sh -s 3000     # subdomain
 ```
 
-## Example command
-
-```bash
-./scripts/tunnel.sh 3000
-```
-
-## Example output (path mode, default)
+### Example output (path mode, default)
 
 ```text
 [tunnel] Starting Caddy on localhost:9090
-[tunnel] Starting cloudflared tunnel 'localhost-tunnel'
-[tunnel] Mode            : path (key in path)
-[tunnel] Tunnel hostname : local.hasso.tech
-[tunnel] Path ID         : k4m8q2w9x7pz (generated)
-[tunnel] Share URL       : https://local.hasso.tech/k4m8q2w9x7pz/
+[tunnel] Starting cloudflared tunnel 'YOUR-TUNNEL-UUID'
+[tunnel] Mode            : path
+[tunnel] Tunnel hostname : preview.example.com
+[tunnel] Path ID         : k4m8
+[tunnel] Share URL       : https://preview.example.com/k4m8/
 [tunnel] Runtime files   : /.../cloudflared-alias/.runtime
-[tunnel] Logs            : /.../.runtime/instances/9090/caddy.log, /.../.runtime/cloudflared/cloudflared.log
+[tunnel] Logs            : /.../.runtime/instances/9090.A1b2C3/caddy.log, /.../.runtime/cloudflared/cloudflared.log
 [tunnel] Running in foreground. Press Ctrl+C to stop.
 ```
 
-## Example final URL
+### Example URLs
 
-- **Path (default):** `https://local.hasso.tech/k4m8q2w9x7pz/` — Caddy strips `/<key>` before proxying.
-- **No-key (`-n`):** `https://local.hasso.tech/` — no key; Swagger and all routes work as-is.
-- **Subdomain (`-s`):** `https://k4m8q2w9x7pz.local.hasso.tech/` — key in hostname; relative URLs work without backend changes.
+- **Path (default):** `https://preview.example.com/k4m8/` — Caddy strips `/<key>` before proxying.
+- **No-key (`-n`):** `https://preview.example.com/` — no key or path stripping.
+- **Subdomain (`-s`):** `https://k4m8.preview.example.com/` — key in hostname; requires wildcard DNS and TLS coverage.
 
 ## How it works
 
@@ -186,10 +605,39 @@ Pass a key after the port to use it; otherwise a random key is generated (path/s
 
 You can run several tunnels at once with **different keys and different backend ports**. Each run gets its own Caddy instance (on a free port from `CADDY_PORT` upward) and one shared cloudflared process forwards traffic to all of them.
 
-If you start a tunnel with a **key or backend port** that is already in use by another run, the script **stops the previous tunnel** (with a short message) and then starts the new one. Examples:
+Caddy listens over HTTP on loopback, including when its selected port is 443,
+with its admin API disabled so parallel instances do not compete for the default
+admin port. All instances must use the same tunnel
+name and credentials-file; stop them before changing that identity. If the shared
+config is missing or its identity cannot be recovered, startup fails and preserves
+existing state. Restore that config or stop the instances explicitly. Hostnames are
+kept per instance. Path ingress rules precede subdomain rules, followed by no-key
+fallbacks on the same host.
+
+Legacy registry rows without a hostname recover it from the persisted cloudflared
+ingress rule for their Caddy port before startup changes routing. If that mapping
+is missing or ambiguous, startup fails and preserves existing state; restore the
+persisted ingress or explicitly stop the instances before starting again.
+
+Backend ports must refer to the app, and cannot use a running launcher's Caddy
+listener port.
+
+Foreground mode reports unexpected Caddy or cloudflared exits and cleans up its
+instance. Shared cloudflared restarts when other runs start or stop keep
+foreground runs active.
+
+If you start a tunnel with a **key or backend port** that is already in use by
+another run, the script starts the new Caddy instance and shared cloudflared
+replacement before **stopping the previous tunnel** (with a short message).
+If either daemon fails to start, existing live instances and history are preserved.
+Dead instances are pruned even when startup fails; shared ingress and current
+share metadata are updated to the surviving instances, provided legacy hostnames
+can be recovered. When none remain, failed startup stops stale cloudflared and
+removes the current share metadata. Examples:
 
 - Same key, different port: the old tunnel for that key is stopped.
 - Same backend port, different key: the old tunnel using that port is stopped.
+- A second no-key run replaces the previous no-key instance.
 
 ```bash
 ./scripts/tunnel.sh 3000 key1    # first tunnel
@@ -199,11 +647,12 @@ If you start a tunnel with a **key or backend port** that is already in use by a
 
 ## Stop and restart
 
-Stop **all** runtime Caddy instances and cloudflared:
+Stop **all** launcher-owned shares, file helpers and the shared cloudflared
+connector:
 
 ```bash
-# foreground mode (default): press Ctrl+C in the running terminal (stops only that instance)
-# detached mode (DETACH=1): use explicit stop to stop everything
+# Legacy foreground mode: Ctrl+C stops only that instance.
+# Structured exposure always detaches; legacy exposure detaches with DETACH=1.
 ./scripts/tunnel.sh stop
 ```
 
@@ -223,13 +672,17 @@ The last 10 tunnels are stored in `.runtime/tunnel-history` with **created** and
 
 You’ll see a numbered list (1 = most recent). Enter a number to run that tunnel, or Enter with no number to cancel. Choosing an entry updates its **last used** time in the history.
 
+History updates after a successful start. If the saved URL differs from the
+current hostname configuration, start a new tunnel explicitly instead.
+
 ## Environment variables (override config file)
 
-- `DEFAULT_MODE` — default mode when no flag: `path`, `subdomain`, `no-key`.
+- `DEFAULT_MODE` — legacy CLI default when no mode flag: `path`, `subdomain`, `no-key`.
 - `CADDY_PORT`, `ID_LENGTH`, `DETACH` — same as in config file.
 - `CLOUDFLARED_BASE_CONFIG` — path to cloudflared config (default: `~/.cloudflared/config.yml`).
 - `SUBDOMAIN_DOMAIN` — for subdomain mode: domain for `<key>.<domain>` (else from cloudflared hostname).
 - `TUNNEL_NAME`, `TUNNEL_HOSTNAME`, `TUNNEL_CREDENTIALS_FILE` — override tunnel config.
+- `ALIAS_PYTHON` — prepared interpreter path for structured share commands and MCP.
 
 Example custom Caddy port:
 
@@ -247,7 +700,10 @@ DETACH=1 ./scripts/tunnel.sh 3000
 
 ### Caddy missing
 
-If you see `Error: 'caddy' is required but not installed`, install Caddy and re-run.
+Run `bash scripts/setup.sh` from the repository root, then export the prepared
+toolchain PATH shown in [Quickstart](#quickstart). Installing an arbitrary system
+Caddy is insufficient for the pinned environment. Verify the prepared
+installation with `bash scripts/check-env.sh`.
 
 ### cloudflared missing
 
@@ -265,7 +721,8 @@ Or set env overrides (`TUNNEL_NAME`, `TUNNEL_HOSTNAME`, `TUNNEL_CREDENTIALS_FILE
 
 ### port already in use
 
-If Caddy port is busy, either stop the conflicting process or run with another port:
+The launcher selects a free listener from `CADDY_PORT` upward. To choose a
+different starting port:
 
 ```bash
 CADDY_PORT=18080 ./scripts/tunnel.sh 3000
@@ -273,13 +730,16 @@ CADDY_PORT=18080 ./scripts/tunnel.sh 3000
 
 ### public URL returns 404
 
-- **Subdomain:** You used an old key hostname, or DNS/ingress for `*.<SUBDOMAIN_DOMAIN>` is missing.
+- **Subdomain:** You used an old key hostname, wildcard DNS is missing, or the keyed hostname is absent from the rendered ingress.
 - **Path:** You used an old key or a URL without the `/<key>/` prefix.
-- Caddy failed to start; check `.runtime/caddy/caddy.log`.
+- Caddy failed to start; check `.runtime/instances/<caddy-port>.<suffix>/caddy.log`.
 
 ### Swagger / OpenAPI: "Try it out" returns 404
 
-Use **subdomain mode** (default): open `https://<key>.local.hasso.tech/swagger` — requests from the UI go to the same origin, so they work without any backend config.
+Use **subdomain mode** (`--url-mode subdomain` for structured commands, `-s` for
+the legacy CLI) with the [required DNS and TLS coverage](#modes). Open
+`https://<key>.preview.example.com/swagger`; root-relative UI requests stay on
+the keyed hostname.
 
 In **path mode**, the backend must use the **`X-Forwarded-Prefix`** header to set Swagger’s server base path (Caddy sends this header).
 
@@ -291,8 +751,228 @@ Check:
 - cloudflared is running (check `.runtime/cloudflared/cloudflared.log`)
 - rendered cloudflared config points to Caddy (`service: http://localhost:<CADDY_PORT>`)
 
+### MCP tools are missing or fail to start
+
+Check `codex mcp get cloudflared_alias` or `claude mcp get cloudflared_alias`,
+then restart the client session. Confirm the wrapper's absolute path still points
+to this installation and run `bash scripts/setup.sh` if its prepared Python is
+missing. Remove obsolete project-only registrations that override user scope;
+see [MCP for all projects](#mcp-for-all-projects).
+
+### Static assets are missing or live HTML does not reload
+
+A single-file selection exposes no neighboring CSS, JavaScript or images.
+Select the containing directory and use relative asset paths in path mode.
+Confirm `list-shares` reports `update_mode: "live"` and `state: "active"`.
+If degraded, inspect `.runtime/publications/<id>/helper.log` and
+`.runtime/cloudflared/cloudflared.log`, then stop and expose only that share
+again. If active but reload is blocked, check EventSource support, Content
+Security Policy and Cloudflare cache/proxy settings described in
+[Static file shares](#static-file-shares). Ordinary refresh
+still obtains the latest successfully prepared copy.
+
 ## Security note
 
 The random prefix is obscurity, not authentication.
 
 For stronger protection, put Cloudflare Access in front of the tunnel hostname.
+
+## Development and Agent Runner
+
+Read [AGENTS.md](AGENTS.md) for ownership and working agreements. The canonical
+[finalization skill](.agents/skills/finalization/SKILL.md) is discovered by Agent
+Runner's `finalization: "auto"` setting. `.claude/skills` links to the same skills.
+`CLAUDE.md` links to `AGENTS.md` so Claude uses the same project instructions.
+
+Install Bash, ShellCheck and the [build prerequisites](#prerequisites), then
+prepare the isolated toolchain with `bash scripts/setup.sh`. Run
+`bash scripts/check.sh` for offline syntax, lint and regression checks using the
+pinned Python and Caddy.
+Tests use temporary project copies and synthetic data; they do not start public
+tunnels or use your `.runtime/`.
+Tests mock cloudflared; file-serving and MCP integration tests use actual pinned
+Caddy and publication helpers over loopback. The official SDK client exercises
+real stdio calls, session shutdown and independent share cleanup. Template checks
+also inspect adapted configuration. These checks do not establish public DNS or
+Cloudflare tunnel access.
+The finalization skill owns the complete required-check sequence.
+
+### Pinned local setup
+
+The releases verified on 2026-10-03 are CPython **3.14.8**, Caddy **2.11.7** and
+cloudflared **2026.9.3**. `deploy/toolchain.json` records exact public artifact
+URLs, sizes and SHA-256 values. `.python-version` and `pyproject.toml` declare
+the runtime and direct dependencies; `requirements.lock` pins the complete
+Python wheel closure, including the test-only `quickjs-ng` browser engine.
+The official MCP SDK is pinned to **2.3.0**. Register its stdio adapter once for
+your user so Codex and Claude Code can control the launcher from any project.
+
+Preparation requires Linux x86_64, bootstrap Python 3.11 or newer,
+`cc`/GCC, `make`, `ar`, `tar`, `xz`, and OpenSSL,
+zlib, libffi and bzip2 development headers. No PGO/LTO or optional readline,
+curses, gdbm, tkinter, sqlite or lzma development headers are required. Compiler
+jobs are limited to eight. Missing prerequisites or incompatible versions fail
+explicitly; no system tools are upgraded.
+
+```bash
+bash scripts/setup.sh
+export PATH="$PWD/.venv/bin:$PWD/.tools/caddy/usr/bin:$PATH"
+bash scripts/check-env.sh
+# Also verify the operator's installed connector, without starting it:
+bash scripts/check-env.sh --cloudflared "$(command -v cloudflared)"
+```
+
+Setup downloads only the frozen artifacts, rejects redirects and verifies every
+size and hash. It retains a private CPython source build and extracted Caddy in
+ignored `.tools/`, and installs the locked wheels offline in ignored `.venv/`.
+The bundled, separately hash-verified pip **26.2.1** supplies installation; there
+is no project-package build or setuptools/wheel installation. Rerunning setup
+verifies a completed installation. An incomplete or stale installation fails
+with instructions to remove it explicitly or choose empty paths; it is never
+silently replaced. Use the PATH above when running the launcher so it selects
+the prepared Caddy. Setup leaves the system cloudflared installation unchanged;
+verify it separately with the connector check above.
+
+For installation without network access, supply a directory containing all
+manifest artifacts under their original filenames or SHA-256 names:
+
+```bash
+bash scripts/setup.sh --offline --artifacts /path/to/verified-artifacts
+```
+
+`--artifacts` always forbids downloads. `--tools DIR` and `--venv DIR` select
+private installation locations; defaults resolve from the project root even
+when invoked from a subdirectory. Checks themselves never download anything.
+
+### Runner artifact preparation
+
+Before execution, the supervisor must declare all 32 manifest URL/hash pairs
+for the exact trusted command `bash scripts/check.sh`, retaining its scratch,
+cache and sourceProjection capabilities. The artifacts total 54,418,213 bytes
+and fit Runner's limits. Keep this declaration and execution inputs frozen.
+Do not copy ignored host environments into the source projection.
+
+When Runner supplies `AGENT_RUNNER_DEPENDENCIES/<sha256>` and scratch through
+`TMPDIR`, the check creates a private scratch directory, verifies the supplied
+read-only artifacts, builds Python, reconstructs wheel filenames, installs
+offline with required hashes, and selects the extracted Caddy. Builds, test
+scratch and installations stay there and are removed on exit. No populated
+cache is required; the process works from an empty cache. Host compiler/header
+prerequisites still apply. Missing or corrupt artifacts fail before compilation.
+The check verifies exact runtime/dependency versions, native imports and
+`pip check`, then preserves the existing Bash syntax, ShellCheck and unittest
+sequence. Cloudflared remains mocked; these checks do not establish public DNS
+or Cloudflare connectivity. In Agent Runner, required checks run exclusively
+in FINALIZE, while staging belongs to the runner's COMMIT or HANDOFF phase.
+
+Keep local tasks, plans and reports under the ignored `LOCAL_ARTIFACTS/` directory.
+Agent Runner's optional project configuration belongs at
+`LOCAL_ARTIFACTS/agent-runner.json`, and local operator additions at
+`LOCAL_ARTIFACTS/agent-runner/rules.md`. Keep its authoritative run state outside
+both the project and task trees. Read the installed operator guide through
+`guidance_read` or `agent-run guidance --project /path/to/cloudflared-alias`
+before supervising a run.
+
+Use `plan-authoring` for a reviewed plan, `plan-execution` on a clean worktree for
+planned local commits, and `polishing` for an existing non-empty local change set.
+`independent` is the default review mode. Finalization validates content; Agent
+Runner owns staging in its commit or handoff phase. Outside a run, requested
+finalization stages relevant changes and drafts a message without committing.
+
+### Static publication internals
+
+The preparation layer in `scripts/publication.py` copies one selected
+file or recursive directory without discovering adjacent assets. It rejects
+source symlinks, the launcher root and its ancestors, and internal metadata
+selections; directory copies omit VCS, launcher and environment metadata.
+Each share has private state in `.runtime/publications/<id>/`. Its managed
+`public/` link selects a complete byte-only generation; metadata and unfinished
+copies stay outside the served root. Failed preparation retains the accepted
+copy. SHA-256 revisions describe copied source bytes (a sorted path/digest
+manifest for directories), with a separate preparation-version-aware revision.
+Sources remain unchanged. Snapshot Caddy routes serve only the accepted copy;
+explicit republication publishes new bytes. File templates support path,
+subdomain and no-key routes, with loopback-only listeners and no automatic TLS
+or admin endpoint. Directory indexes are `index.html` and `index.htm`; other
+static files retain their ordinary MIME types, without directory browsing.
+
+The launcher runs `scripts/publication.py serve-manual --config CONFIG.json`
+with the selected prepared interpreter. Its private JSON configuration contains
+`source`, `share_id`, `project_root` and a loopback `port`.
+The template's `__PUBLIC_ROOT__` is the managed `public/` path. Snapshot rendering
+leaves `__CACHE_POLICY__`, `__PREPARATION_HANDLER__` and `__EVENT_HANDLER__` empty;
+manual rendering leaves `__EVENT_HANDLER__` empty, sets `__CACHE_POLICY__` to
+`header >Cache-Control "no-store"` and uses this `__PREPARATION_HANDLER__` block:
+
+```caddyfile
+forward_auth 127.0.0.1:PORT {
+    uri /__alias/prepare
+    @unavailable status 5xx
+    handle_response @unavailable {
+        error "Publication preparation unavailable" 502
+    }
+}
+```
+
+The templates serve the accepted copy if the helper is unavailable or returns
+a server error, retaining the route's key/path validation and no-store policy.
+Each GET/HEAD request prepares only the requested file or directory index before
+Caddy serves bytes. Manual mode has no watcher or reload injection. Deletions
+remove their served copies; unsafe reads and failed preparation preserve the
+last accepted bytes. Traversal, private metadata and the reserved `__alias`
+control namespace cannot be served. The helper never sends static file bodies.
+
+The live helper uses `serve-live` with the same private configuration,
+plus `event_url`: the browser's same-origin event path, including the key prefix
+in path mode (for example, `/preview/__alias/events`). It defaults to
+`/__alias/events` for subdomain and no-key routes.
+It installs native Linux `InotifyObserver` watches before preparing the initial
+copy, then debounces source events and activates complete generations before
+announcing their effective revisions. Directory watches are recursive; filtered
+parent watches detect standalone atomic saves. Containing-directory watches
+also recover replacement of the selected directory or a standalone file's parent.
+Read notifications and idle time do not trigger preparation;
+excluded metadata stays outside the publication.
+Identical content does not announce a revision. Failed preparation preserves
+the accepted copy and a subsequent native event can recover it. No filesystem
+polling or subscriber is needed for updates.
+
+Live rendering leaves `__PREPARATION_HANDLER__` empty, sets `__CACHE_POLICY__` to
+`header >Cache-Control "no-store"` for HTML and assets, and uses this event block
+for `__EVENT_HANDLER__`:
+
+```caddyfile
+@events path /__alias/events
+reverse_proxy @events 127.0.0.1:PORT {
+    flush_interval -1
+}
+```
+
+The event route stays inside the selected key route; path mode strips the key
+prefix before proxying. SSE responses use `Cache-Control: no-store` and stream
+without compression or buffering. The deferred header policy replaces upstream
+cache headers rather than appending a duplicate value. Each connection/reconnect
+immediately receives the current `revision` event, whose JSON data contains `revision` and
+`source_revision`; its event ID is the effective revision. Slow subscribers keep
+only the latest pending revision. Comment heartbeats maintain idle connections
+without inspecting sources. Static requests serve current accepted bytes even
+without a subscription, and event-service failure leaves accepted content
+available with no-store caching.
+
+Live preparation injects `scripts/reload.js` into served `.html` and `.htm` copies,
+including directory indexes and nested pages. Sources, snapshot and manual copies,
+and other formats stay unchanged. The script embeds the accepted effective
+revision and event path, uses native `EventSource`, and reloads once when a
+different revision arrives. Equal initial/reconnect revisions and heartbeats
+do not reload. Activation and back-forward-cache restoration replace subscriptions
+and recover missed changes; there is no browser polling. Source hashes exclude
+injected bytes, while the effective revision accounts for the script and event
+path, so asset-only changes also refresh HTML without a revision loop.
+
+Missing EventSource, blocked/disconnected SSE, or HTML that cannot execute the
+script (including restrictive Content Security Policy) leave native publication
+updates running. Ordinary refresh obtains the latest accepted content, including
+non-HTML formats. Custom edge-cache rules can override `no-store` and must be
+configured to preserve this behavior.
+Both helpers run independently of the invoking launcher process. File changes
+do not restart Caddy or the shared cloudflared connector.

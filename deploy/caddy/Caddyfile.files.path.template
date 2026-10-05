@@ -1,0 +1,72 @@
+{
+    admin off
+    auto_https off
+    http_port __CADDY_PORT__
+}
+
+(publication_path) {
+    root * "__PUBLIC_ROOT__"
+    @{args[0]} expression `{http.request.orig_uri.path} == '/__PATH_ID__'`
+    # Caddy detects file/directory redirects; preserve the escaped original URI.
+    map {http.request.orig_uri} {publication_canonical_uri} {
+        ~^([^?]*)/([?].*)?$ ${1}${2}
+        ~^([^?]*)([?].*)?$ ${1}/${2}
+    }
+    redir @{args[0]} {publication_canonical_uri} 308
+    header {
+        Location {publication_canonical_uri}
+        match status 308
+        defer
+    }
+}
+
+:__CADDY_PORT__ {
+    bind 127.0.0.1
+    @prefixed path /__PATH_ID__ /__PATH_ID__/*
+
+    handle @prefixed {
+        route {
+            @traversal expression `{http.request.orig_uri}.matches('(?i)^[^?]*(/|%2f)([.]|%2e){1,2}(/|%2f|[?]|$)')`
+            respond @traversal "Invalid publication path" 400
+            uri strip_prefix /__PATH_ID__
+            __CACHE_POLICY__
+            __EVENT_HANDLER__
+            @control path /__alias /__alias/*
+            respond @control 404
+            __PREPARATION_HANDLER__
+            import publication_path base
+            __FILE_HANDLER__
+            file_server {
+                index index.html index.htm
+            }
+        }
+    }
+
+    respond "404 Not Found. Please verify the key in the URL." 404
+
+    # Restore the validated content URI, then strip its key for the fallback.
+    handle_errors 502 503 504 {
+        route {
+            rewrite * {http.request.orig_uri}
+            uri strip_prefix /__PATH_ID__
+            __CACHE_POLICY__
+            @fallback_control path /__alias /__alias/*
+            respond @fallback_control 503
+            @fallback_method not method GET HEAD
+            respond @fallback_method 405
+            import publication_path fallback_base
+            __FALLBACK_FILE_HANDLER__
+            file_server {
+                index index.html index.htm
+                status 200
+                pass_thru
+            }
+            respond 404
+        }
+    }
+
+    handle_errors {
+        __CACHE_POLICY__
+        respond "" {http.error.status_code}
+    }
+}

@@ -4,3 +4,18 @@
 # Optional local environment override files
 .env
 .env.*
+
+# Agent Runner tasks, plans, reports, local configuration and operator guidance
+/LOCAL_ARTIFACTS/
+/.agent-runner.json
+
+# Python regression-test bytecode
+__pycache__/
+*.py[cod]
+
+# Isolated pinned runtimes, verified downloads and Python dependencies
+/.tools/
+/.venv/
+
+# Legacy project-local MCP registration; user-level setup is documented in README
+/.codex/config.toml
