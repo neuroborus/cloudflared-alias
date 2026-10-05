@@ -41,7 +41,7 @@ def collect_artifacts(manifest, directory, download=False):
     opener = urllib.request.build_opener(NoRedirect)
     paths = {}
     for item in manifest["runtime_artifacts"] + manifest["dependency_artifacts"]:
-        # Runner supplies hash-named read-only files; local downloads retain names.
+        # Offline artifacts may use hashes; local downloads retain filenames.
         hashed = directory / item["sha256"]
         path = hashed if hashed.exists() else directory / item["filename"]
         if not path.exists() and download:

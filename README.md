@@ -106,7 +106,7 @@ and tool arguments.
 - [Parallel runs and recovery](#parallel-runs-and-conflicts), [stopping](#stop-and-restart) and [history](#history-interactive-pick)
 - [Shell shortcut](#shell-shortcut) and [pinned local setup](#pinned-local-setup)
 - [Troubleshooting](#troubleshooting)
-- [Development and Agent Runner](#development-and-agent-runner)
+- [Development](#development)
 
 ## Commands and flags
 
@@ -777,12 +777,11 @@ The random prefix is obscurity, not authentication.
 
 For stronger protection, put Cloudflare Access in front of the tunnel hostname.
 
-## Development and Agent Runner
+## Development
 
-Read [AGENTS.md](AGENTS.md) for ownership and working agreements. The canonical
-[finalization skill](.agents/skills/finalization/SKILL.md) is discovered by Agent
-Runner's `finalization: "auto"` setting. `.claude/skills` links to the same skills.
-`CLAUDE.md` links to `AGENTS.md` so Claude uses the same project instructions.
+Read [AGENTS.md](AGENTS.md) for project instructions and the
+[finalization skill](.agents/skills/finalization/SKILL.md) for required validation
+and change hygiene.
 
 Install Bash, ShellCheck and the [build prerequisites](#prerequisites), then
 prepare the isolated toolchain with `bash scripts/setup.sh`. Run
@@ -843,41 +842,6 @@ bash scripts/setup.sh --offline --artifacts /path/to/verified-artifacts
 `--artifacts` always forbids downloads. `--tools DIR` and `--venv DIR` select
 private installation locations; defaults resolve from the project root even
 when invoked from a subdirectory. Checks themselves never download anything.
-
-### Runner artifact preparation
-
-Before execution, the supervisor must declare all 32 manifest URL/hash pairs
-for the exact trusted command `bash scripts/check.sh`, retaining its scratch,
-cache and sourceProjection capabilities. The artifacts total 54,418,213 bytes
-and fit Runner's limits. Keep this declaration and execution inputs frozen.
-Do not copy ignored host environments into the source projection.
-
-When Runner supplies `AGENT_RUNNER_DEPENDENCIES/<sha256>` and scratch through
-`TMPDIR`, the check creates a private scratch directory, verifies the supplied
-read-only artifacts, builds Python, reconstructs wheel filenames, installs
-offline with required hashes, and selects the extracted Caddy. Builds, test
-scratch and installations stay there and are removed on exit. No populated
-cache is required; the process works from an empty cache. Host compiler/header
-prerequisites still apply. Missing or corrupt artifacts fail before compilation.
-The check verifies exact runtime/dependency versions, native imports and
-`pip check`, then preserves the existing Bash syntax, ShellCheck and unittest
-sequence. Cloudflared remains mocked; these checks do not establish public DNS
-or Cloudflare connectivity. In Agent Runner, required checks run exclusively
-in FINALIZE, while staging belongs to the runner's COMMIT or HANDOFF phase.
-
-Keep local tasks, plans and reports under the ignored `LOCAL_ARTIFACTS/` directory.
-Agent Runner's optional project configuration belongs at
-`LOCAL_ARTIFACTS/agent-runner.json`, and local operator additions at
-`LOCAL_ARTIFACTS/agent-runner/rules.md`. Keep its authoritative run state outside
-both the project and task trees. Read the installed operator guide through
-`guidance_read` or `agent-run guidance --project /path/to/cloudflared-alias`
-before supervising a run.
-
-Use `plan-authoring` for a reviewed plan, `plan-execution` on a clean worktree for
-planned local commits, and `polishing` for an existing non-empty local change set.
-`independent` is the default review mode. Finalization validates content; Agent
-Runner owns staging in its commit or handoff phase. Outside a run, requested
-finalization stages relevant changes and drafts a message without committing.
 
 ### Static publication internals
 

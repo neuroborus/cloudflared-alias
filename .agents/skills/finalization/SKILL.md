@@ -28,15 +28,21 @@ The first command owns Bash syntax checks, ShellCheck and offline regression tes
 
 Fix in-scope failures without weakening checks, then rerun the gate against the resulting content. If an official skill validator is available, run it additionally after editing a skill; do not make the gate depend on an absolute machine-specific tool path.
 
-Inside Agent Runner, preserve its established check inventory and order. A check selected for runner-trusted execution must not run inside an agent turn: report its reserved identity as `NOT_RUN` for the runner to execute. Content repairs invalidate earlier finalization evidence.
+Preserve the established check inventory and order. If an owning workflow reserves
+a check, leave execution to that owner and report it as `NOT_RUN` in the agent
+turn. Content repairs invalidate earlier finalization evidence.
 
 ## Staging and commit boundary
 
 Finalization never creates a commit or pushes.
 
-Inside Agent Runner, leave staging, index-relative checks and commit-message drafting to the runner-owned `COMMIT` or `HANDOFF` phase. Use checks over workspace content or `HEAD`; deferring index work is not a failed or skipped content check.
+Respect any active workflow's staging boundary. Use checks over workspace content
+or `HEAD` until that boundary permits staging.
 
-Outside Agent Runner, when the user requests finalization, stage only the relevant paths after checks pass. Verify the staged changes with `git diff --cached --check` and `git status --short`. Preserve unrelated staged content. Commit only on a separate explicit user request.
+When the user requests finalization and no owning workflow reserves staging,
+stage only the relevant paths after checks pass. Verify the staged changes with
+`git diff --cached --check` and `git status --short`. Preserve unrelated staged
+content. Commit only on an explicit user request.
 
 When drafting a message, use a single Conventional Commit subject, `type(scope): imperative summary`, at most 72 characters, without a body or authorship trailer. Suggested scopes are `tunnel`, `config`, `tests`, `docs` and `agents`; follow existing history when applicable.
 
