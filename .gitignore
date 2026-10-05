@@ -5,7 +5,7 @@
 .env
 .env.*
 
-# Agent Runner tasks, plans, reports, local configuration and operator guidance
+# Local tasks, plans, reports and configuration
 /LOCAL_ARTIFACTS/
 /.agent-runner.json
 

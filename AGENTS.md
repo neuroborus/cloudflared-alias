@@ -9,7 +9,7 @@ to `AGENTS.md`; edit shared instructions here.
 - Keep code comments, logs, documentation, and commit subjects in English.
 - Preserve unrelated user changes and existing tunnel processes and runtime state.
 - Do not read real Cloudflare credentials or start public tunnels during automated checks. Use synthetic configuration and isolated temporary copies of the project.
-- Do not create commits or push unless the user explicitly requests it. Finalization validates and, when requested outside Agent Runner, stages the relevant changes and drafts a message.
+- Do not create commits or push unless the user explicitly requests it. Finalization validates and, when requested, stages the relevant changes and drafts a message.
 
 ## Agent publication guidance
 
@@ -43,7 +43,7 @@ The alias owns shares independently of the MCP session.
 | `scripts/setup.sh`, `scripts/check-env.sh`, `scripts/toolchain.py` | Isolated pinned toolchain preparation and prerequisite verification |
 | `pyproject.toml`, `requirements.lock`, `.python-version`, `deploy/toolchain.json` | Runtime and dependency pins, verified installation artifacts |
 | `.tools/`, `.venv/` | Ignored local runtimes and dependencies; trusted checks prepare their own scratch installations |
-| `README.md` | User-facing operation and Agent Runner setup |
+| `README.md` | Installation, operation and development guidance |
 | `AGENTS.md`, `CLAUDE.md` | Shared agent instructions; `CLAUDE.md` links to `AGENTS.md` |
 | `.agents/skills/` | Canonical project skills; `.claude/skills` links here |
 | `.runtime/` | Ignored live launcher state; never use it as test scratch |
@@ -55,4 +55,5 @@ Use the [finalization skill](.agents/skills/finalization/SKILL.md) after impleme
 
 Edit skills through `.agents/skills/`; do not create a second copy under `.claude/`. Update this map and README when layout or public behavior changes.
 
-When Agent Runner owns this worktree, follow its phase permissions. Finalization is content validation; staging belongs to its `COMMIT` or `HANDOFF` phase. Keep frozen inputs, local configuration and finalization guidance unchanged for the lifetime of a run.
+Respect existing worktree ownership and validation reservations. Do not change
+protected inputs or guidance while an owning workflow is active.

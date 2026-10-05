@@ -13,9 +13,9 @@ for dependency in bash shellcheck python3 flock awk sed tr head tail mktemp nohu
 done
 
 if [[ -n "${AGENT_RUNNER_DEPENDENCIES:-}" ]]; then
-  # Runner provides both this read-only artifact directory and private scratch.
+  # Isolated checks use a read-only artifact directory and private scratch.
   if [[ -z "${TMPDIR:-}" || ! -d "$TMPDIR" ]]; then
-    printf '[check] Runner artifact preparation requires TMPDIR scratch\n' >&2
+    printf '[check] Offline artifact preparation requires TMPDIR scratch\n' >&2
     exit 1
   fi
   CHECK_SCRATCH="$(mktemp -d "$TMPDIR/cloudflared-alias-check.XXXXXX")"
